@@ -1,0 +1,14 @@
+# Gemini / Google GenAI
+google-genai>=0.4.0
+
+# Progress bars
+tqdm>=4.66.0
+
+# Numerical utilities
+numpy>=1.23.0
+
+# Deep learning (CPU by default; use conda for CUDA)
+torch>=2.0.0
+
+# Video / image processing
+opencv-python>=4.8.0

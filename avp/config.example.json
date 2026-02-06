@@ -1,0 +1,24 @@
+{
+  "project": "",
+  "location": [
+    "us-central1",
+    "us-east1",
+    "us-east4",
+    "us-east5",
+    "us-south1",
+    "us-west1",
+    "us-west4"
+  ],
+  "model": "gemini-2.5-pro",
+  "plan_replan_model": "gemini-2.5-pro",
+  "execute_model": "gemini-2.5-pro",
+  "api_key": "",
+  "annotation_path": "",
+  "output_dir": "",
+  "default_media_resolution": "medium",
+  "prefer_compressed": true,
+  "debug": false,
+  "max_frame_low": 2048,
+  "max_frame_medium": 512,
+  "max_frame_high": 128
+}
