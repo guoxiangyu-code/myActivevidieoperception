@@ -24,10 +24,10 @@
 <br>
 
 ## Table of Contents
-- [Highlights](#highlights-)
+- [Highlights](#highlights)
 - [Setup](#setup)
-- [Evaluation Code](#parallel-evaluation)
-- [Citation](#citation-)
+- [Evaluation](#evaluation)
+- [Citation](#citation)
 
 ---
 
@@ -87,7 +87,7 @@ For API Keys:
 **API key (Google AI Studio):** Set the `GEMINI_API_KEY` environment variable (or optional `api_key` in config).
 
 ---
-## Evaluation Code
+## Evaluation
 
 Set these in `avp/parrelel_run.sh` before running:
 
