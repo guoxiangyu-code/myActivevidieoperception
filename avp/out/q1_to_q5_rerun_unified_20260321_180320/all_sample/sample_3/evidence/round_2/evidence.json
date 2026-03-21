@@ -1,0 +1,59 @@
+{
+  "detailed_response": "经过仔细观察，在视频第二节中找到了一个与用户描述相似但细节有出入的场景。在比赛第二节，时间戳约 30:10 处，雷霆队0号球员威斯布鲁克持球从弧顶突破。他突破的直接防守人是勇士队40号球员哈里森·巴恩斯，并非5号球员马里斯·斯贝茨。斯贝茨此时正在禁区内作为协防球员。当威斯布鲁克突破巴恩斯后直接上篮时，斯贝茨上前进行干扰。在此次防守中，斯贝茨的动作是举起双手尝试“封盖”，而不是伸手进行“抢断”。尽管有斯贝茨的干扰，威斯布鲁克依然上篮得分。",
+  "key_evidence": [
+    {
+      "timestamp_start": 1810,
+      "timestamp_end": 1813,
+      "description": "第二节比赛中段，雷霆0号威斯布鲁克突破勇士40号巴恩斯的防守，面对协防的勇士5号斯贝茨，上篮得分。斯贝茨的动作是举手封盖。"
+    },
+    {
+      "timestamp_start": 1824,
+      "timestamp_end": 1829,
+      "description": "该次进攻的慢动作回放，清晰显示斯贝茨是作为协防球员，并尝试封盖而非抢断。"
+    }
+  ],
+  "reasoning": "经过仔细观察，在视频第二节中找到了一个与用户描述相似但细节有出入的场景。在比赛第二节，时间戳约 30:10 处，雷霆队0号球员威斯布鲁克持球从弧顶突破。他突破的直接防守人是勇士队40号球员哈里森·巴恩斯，并非5号球员马里斯·斯贝茨。斯贝茨此时正在禁区内作为协防球员。当威斯布鲁克突破巴恩斯后直接上篮时，斯贝茨上前进行干扰。在此次防守中，斯贝茨的动作是举起双手尝试“封盖”，而不是伸手进行“抢断”。尽管有斯贝茨的干扰，威斯布鲁克依然上篮得分。",
+  "frames_used": [
+    {
+      "start": 0.0,
+      "end": 1839.3666666666666,
+      "fps": 0.5
+    }
+  ],
+  "model_call": {
+    "model": "gemini-2.5-pro",
+    "fps": 0.5,
+    "media_resolution": "low",
+    "prompt_version": "v2_structured",
+    "source_video_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+    "resolved_video_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+    "time_base": "dataset_reference_only",
+    "media_inputs": [
+      {
+        "input_type": "reencoded_full_range_clip",
+        "source_video_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+        "resolved_video_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+        "clip_path": "avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_3/temp_clips/step_1_uniform_reencoded_0_1839367.mp4",
+        "absolute_start_sec": 0.0,
+        "absolute_end_sec": 1839.3666666666666,
+        "clip_time_base": "raw_video_seconds"
+      }
+    ],
+    "time_normalization": {
+      "applied": false,
+      "conversion": "none",
+      "canonical_reference": "raw_video_seconds"
+    },
+    "start_offset": null,
+    "end_offset": "1839.3666666666666s",
+    "clip_paths": [
+      "avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_3/temp_clips/step_1_uniform_reencoded_0_1839367.mp4"
+    ]
+  },
+  "timestamp": "2026-03-21T10:14:57Z",
+  "round_id": 2,
+  "interval_map": {
+    "[1810,1813]": "第二节比赛中段，雷霆0号威斯布鲁克突破勇士40号巴恩斯的防守，面对协防的勇士5号斯贝茨，上篮得分。斯贝茨的动作是举手封盖。",
+    "[1824,1829]": "该次进攻的慢动作回放，清晰显示斯贝茨是作为协防球员，并尝试封盖而非抢断。"
+  }
+}

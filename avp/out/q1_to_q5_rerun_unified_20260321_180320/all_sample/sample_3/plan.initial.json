@@ -1,0 +1,19 @@
+{
+  "plan_version": "v1",
+  "query": "在第二节初期，俄克拉荷马城雷霆队0号球员（拉塞尔·威斯布鲁克）成功突破金州勇士队5号球员（马里斯·斯贝茨）的防守并上篮得分。如果当时勇士队5号球员在防守时没有试图去“抢断”，而是选择“保持防守位置”，那么最可能发生什么？",
+  "watch": {
+    "load_mode": "region",
+    "fps": 2.0,
+    "spatial_token_rate": "medium",
+    "regions": [
+      [
+        530.0,
+        560.0
+      ]
+    ]
+  },
+  "description": "Analyze the specified basketball play by examining player positioning, momentum, and defensive alignments to support reasoning about a hypothetical outcome.",
+  "completion_criteria": "The observation is complete when the specified play involving Westbrook and Speights has been analyzed, focusing on the spatial context required to reason about the counterfactual scenario.",
+  "final_answer": null,
+  "complete": false
+}

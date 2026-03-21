@@ -1,0 +1,33 @@
+{
+  "video_id": "Basketball_Full_001_1",
+  "video_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+  "question": "\u6bd4\u8d5b\u5f00\u59cb\u540e\uff0c\u4fc4\u514b\u62c9\u8377\u9a6c\u57ce\u96f7\u9706\u961f\u5728\u5f97\u5230\u524d8\u5206\u7684\u8fc7\u7a0b\u4e2d\uff0c\u603b\u5171\u5b8c\u6210\u4e86\u591a\u5c11\u6b21\u4e09\u5206\u51fa\u624b\uff1f",
+  "options": [],
+  "answer": "2\u6b21",
+  "duration": 1839.3666666666666,
+  "task_type": "\u611f\u77e5\u63a8\u7406",
+  "time_base": "dataset_reference_only",
+  "time_reference": "",
+  "reference_time_source": "cot_reference",
+  "reference_times_sec": [
+    125,
+    157,
+    180
+  ],
+  "reference_time_range_sec": [
+    125,
+    180
+  ],
+  "reference_duration_sec": 55,
+  "temporal_hint_summary": "Dataset-provided reference timings from cot_reference: 02:05, 02:37, 03:00. The referenced event sequence spans about 55 seconds in dataset-local timing. These timings may not match absolute raw-video seconds, so use them only as weak hints for event order and rough duration, not as exact localization coordinates.",
+  "full_sample": {
+    "id": "Basketball_Full_001_1_2",
+    "video_id": "Basketball_Full_001_1",
+    "task_type": "\u611f\u77e5\u63a8\u7406",
+    "question": "\u6bd4\u8d5b\u5f00\u59cb\u540e\uff0c\u4fc4\u514b\u62c9\u8377\u9a6c\u57ce\u96f7\u9706\u961f\u5728\u5f97\u5230\u524d8\u5206\u7684\u8fc7\u7a0b\u4e2d\uff0c\u603b\u5171\u5b8c\u6210\u4e86\u591a\u5c11\u6b21\u4e09\u5206\u51fa\u624b\uff1f",
+    "answer": "2\u6b21",
+    "cot_reference": "1. 02:05\uff0c\u96f7\u9706\u961f0\u53f7\u7403\u5458\u4e0a\u7bee\u5f97\u5206\uff0c2-0\u3002\n2. 02:37\uff0c\u96f7\u9706\u961f35\u53f7\u7403\u5458\u547d\u4e2d\u4e00\u8bb0\u4e09\u5206\uff0c5-0\u3002\u8fd9\u662f\u7b2c\u4e00\u6b21\u4e09\u5206\u51fa\u624b\u3002\n3. 03:00\uff0c\u96f7\u9706\u961f21\u53f7\u7403\u5458\u5728\u5e95\u89d2\u547d\u4e2d\u4e00\u8bb0\u4e09\u5206\uff0c8-0\u3002\u8fd9\u662f\u7b2c\u4e8c\u6b21\u4e09\u5206\u51fa\u624b\u3002",
+    "path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+    "duration": 1839.3666666666666
+  }
+}

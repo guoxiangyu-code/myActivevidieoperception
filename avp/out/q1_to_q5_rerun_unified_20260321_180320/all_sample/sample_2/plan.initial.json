@@ -1,0 +1,19 @@
+{
+  "plan_version": "v1",
+  "query": "金州勇士队30号球员在比赛开局阶段命中三分球，这个得分机会主要是通过哪种方式创造出来的？",
+  "watch": {
+    "load_mode": "region",
+    "fps": 2.0,
+    "spatial_token_rate": "medium",
+    "regions": [
+      [
+        245.0,
+        275.0
+      ]
+    ]
+  },
+  "description": "Analyze the tactical play, including player movements and passes, leading up to player #30's three-point shot to determine how the scoring opportunity was created.",
+  "completion_criteria": "Observation is complete when the offensive play leading to the three-point shot within the specified time segment has been analyzed.",
+  "final_answer": null,
+  "complete": false
+}

@@ -1,0 +1,14 @@
+{
+  "plan_version": "v1",
+  "query": "比赛开始后，俄克拉荷马城雷霆队在得到前8分的过程中，总共完成了多少次三分出手？",
+  "watch": {
+    "load_mode": "uniform",
+    "fps": 2.0,
+    "spatial_token_rate": "medium",
+    "regions": []
+  },
+  "description": "Scan the video from the beginning, track the Oklahoma City Thunder's score, and count their 3-point attempts until they reach exactly 8 points.",
+  "completion_criteria": "The observation is complete once the Oklahoma City Thunder has scored 8 points, and all 3-point attempts made by them during that scoring process have been counted.",
+  "final_answer": null,
+  "complete": false
+}

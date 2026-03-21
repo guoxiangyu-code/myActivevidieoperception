@@ -1,0 +1,45 @@
+{
+  "detailed_response": "经过仔细观察，在本视频片段中并未找到用户查询中描述的事件。该片段显示的是比赛第一节的最后几分钟，而不是第二节初期。视频中，金州勇士队（GSW）和俄克拉荷马城雷霆队（OKC）进行了一次攻防转换。OKC的杜兰特投篮不中，随后GSW发动快攻，最终以OKC球员犯规告终。视频中没有出现OKC 0号球员威斯布鲁克突破GSW 5号球员斯贝茨并上篮得分的场景。",
+  "key_evidence": [],
+  "reasoning": "经过仔细观察，在本视频片段中并未找到用户查询中描述的事件。该片段显示的是比赛第一节的最后几分钟，而不是第二节初期。视频中，金州勇士队（GSW）和俄克拉荷马城雷霆队（OKC）进行了一次攻防转换。OKC的杜兰特投篮不中，随后GSW发动快攻，最终以OKC球员犯规告终。视频中没有出现OKC 0号球员威斯布鲁克突破GSW 5号球员斯贝茨并上篮得分的场景。",
+  "frames_used": [
+    {
+      "start": 530.0,
+      "end": 560.0,
+      "fps": 2.0
+    }
+  ],
+  "model_call": {
+    "model": "gemini-2.5-pro",
+    "fps": 2.0,
+    "media_resolution": "medium",
+    "prompt_version": "v2_structured",
+    "source_video_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+    "resolved_video_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+    "time_base": "dataset_reference_only",
+    "media_inputs": [
+      {
+        "input_type": "clip",
+        "source_video_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+        "resolved_video_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/Basketball/Full/Basketball_Full_001/Basketball_Full_001_1.mp4",
+        "clip_path": "avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_3/temp_clips/step_1_region_0_530000_560000.mp4",
+        "absolute_start_sec": 530.0,
+        "absolute_end_sec": 560.0,
+        "clip_time_base": "clip_local_seconds"
+      }
+    ],
+    "time_normalization": {
+      "applied": false,
+      "conversion": "none",
+      "canonical_reference": "raw_video_seconds"
+    },
+    "start_offset": "530.0s",
+    "end_offset": "560.0s",
+    "clip_paths": [
+      "avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_3/temp_clips/step_1_region_0_530000_560000.mp4"
+    ]
+  },
+  "timestamp": "2026-03-21T10:12:02Z",
+  "round_id": 1,
+  "interval_map": {}
+}
