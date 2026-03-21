@@ -280,6 +280,26 @@ def find_compressed_video_fallback(original_path: str) -> Optional[str]:
     return None
 
 
+def resolve_video_path(video_path: str, prefer_compressed: bool = True) -> Tuple[str, Optional[str]]:
+    """Resolve the concrete video file path to use for model input.
+
+    Args:
+        video_path: Requested source video path
+        prefer_compressed: Whether to transparently use a compressed fallback when available
+
+    Returns:
+        Tuple of (resolved_path, compressed_fallback_path). The second element is None
+        when no compressed fallback was used.
+    """
+    if not prefer_compressed:
+        return video_path, None
+
+    compressed_path = find_compressed_video_fallback(video_path)
+    if compressed_path:
+        return compressed_path, compressed_path
+    return video_path, None
+
+
 def get_video_path(sample: Dict[str, Any], prefer_compressed: bool = True, debug: bool = False) -> str:
     """Get video path, preferring compressed version if available.
     
@@ -293,20 +313,16 @@ def get_video_path(sample: Dict[str, Any], prefer_compressed: bool = True, debug
     """
     original_path = sample.get("path", sample.get("video_path", ""))
     
-    if not prefer_compressed:
-        return original_path
-    
-    compressed_path = find_compressed_video_fallback(original_path)
-    
+    resolved_path, compressed_path = resolve_video_path(original_path, prefer_compressed=prefer_compressed)
     if compressed_path:
         if debug:
             print(f"✅ Using compressed video: {compressed_path}")
-        return compressed_path
+        return resolved_path
     
     if debug:
         print(f"ℹ️  No compressed video found, using original: {original_path}")
     
-    return original_path
+    return resolved_path
 
 
 # ======================================================
@@ -678,6 +694,130 @@ def create_video_clip(video_path: str, start_time: float, end_time: float,
     except Exception as e:
         if debug:
             print(f"❌ Error creating video clip: {e}")
+        return None
+
+
+def create_reencoded_video_clip(
+    video_path: str,
+    start_time: float,
+    end_time: float,
+    clip_name: str = None,
+    temp_dir: str = None,
+    scale_width: int = 480,
+    video_bitrate: str = "220k",
+    audio_bitrate: Optional[str] = None,
+    frame_rate: Optional[float] = None,
+    crf: int = 32,
+    debug: bool = True,
+) -> Optional[str]:
+    """Create a smaller re-encoded clip for payload-constrained API calls."""
+    if not check_ffmpeg_available():
+        if debug:
+            print("⚠️  ffmpeg not available, cannot create re-encoded clip")
+        return None
+
+    if not os.path.exists(video_path):
+        if debug:
+            print(f"❌ Video file not found: {video_path}")
+        return None
+
+    if not temp_dir:
+        try:
+            temp_dir = ensure_temp_clips_dir(video_path, debug=debug)
+        except OSError:
+            return None
+    else:
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+        except OSError as e:
+            if debug:
+                print(f"❌ Error creating temp directory {temp_dir}: {e}")
+            return None
+
+    if clip_name is None:
+        video_name = Path(video_path).stem
+        clip_name = f"{video_name}_reencoded_{start_time:.1f}s_{end_time:.1f}s.mp4"
+    elif not clip_name.endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+        clip_name = f"{clip_name}.mp4"
+
+    clip_path = os.path.join(temp_dir, clip_name)
+    if os.path.exists(clip_path):
+        if debug:
+            print(f"ℹ️  Using existing re-encoded clip: {clip_path}")
+        return clip_path
+
+    try:
+        start_hours = int(start_time // 3600)
+        start_minutes = int((start_time % 3600) // 60)
+        start_seconds = int(start_time % 60)
+        start_milliseconds = int((start_time % 1) * 1000)
+        start_str = f"{start_hours:02d}:{start_minutes:02d}:{start_seconds:02d}.{start_milliseconds:03d}"
+
+        end_hours = int(end_time // 3600)
+        end_minutes = int((end_time % 3600) // 60)
+        end_seconds = int(end_time % 60)
+        end_milliseconds = int((end_time % 1) * 1000)
+        end_str = f"{end_hours:02d}:{end_minutes:02d}:{end_seconds:02d}.{end_milliseconds:03d}"
+
+        encoder_candidates = ["libopenh264", "mpeg4"]
+        last_error = None
+        for video_encoder in encoder_candidates:
+            cmd = [
+                'ffmpeg',
+                '-hide_banner',
+                '-loglevel', 'error',
+                '-ss', start_str,
+                '-to', end_str,
+                '-i', video_path,
+                '-vf', f'scale={scale_width}:-2',
+                '-c:v', video_encoder,
+                '-b:v', video_bitrate,
+                '-movflags', '+faststart',
+                '-pix_fmt', 'yuv420p',
+                '-avoid_negative_ts', 'make_zero',
+            ]
+            if frame_rate is not None and frame_rate > 0:
+                cmd.extend(['-r', f'{frame_rate}'])
+            if audio_bitrate:
+                cmd.extend(['-c:a', 'aac', '-b:a', audio_bitrate])
+            else:
+                cmd.append('-an')
+            cmd.extend([
+                '-y',
+                clip_path,
+            ])
+
+            if debug:
+                print(f"🎬 Creating re-encoded video clip: {start_time:.1f}s - {end_time:.1f}s")
+                print(f"   Encoder: {video_encoder}")
+                print(f"   Output: {clip_path}")
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode == 0 and os.path.exists(clip_path):
+                clip_size = os.path.getsize(clip_path) / (1024 * 1024)
+                if debug:
+                    print(f"✅ Created re-encoded clip: {clip_path} ({clip_size:.2f} MB)")
+                return clip_path
+
+            last_error = result.stderr
+            if os.path.exists(clip_path):
+                try:
+                    os.remove(clip_path)
+                except OSError:
+                    pass
+            if debug:
+                print(f"⚠️  Re-encode with {video_encoder} failed: {result.stderr}")
+
+        if debug:
+            print(f"❌ Failed to create re-encoded clip: {last_error}")
+        return None
+    except subprocess.TimeoutExpired:
+        if debug:
+            print(f"⏰ ffmpeg timeout while re-encoding clip {start_time:.1f}s - {end_time:.1f}s")
+        return None
+    except Exception as e:
+        if debug:
+            print(f"❌ Error creating re-encoded clip: {e}")
         return None
 
 

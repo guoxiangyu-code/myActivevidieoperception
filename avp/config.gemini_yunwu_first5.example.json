@@ -1,21 +1,15 @@
 {
   "project": "",
   "location": [
-    "us-central1",
-    "us-east1",
-    "us-east4",
-    "us-east5",
-    "us-south1",
-    "us-west1",
-    "us-west4"
+    "global"
   ],
   "model": "gemini-2.5-pro",
   "plan_replan_model": "gemini-2.5-pro",
   "execute_model": "gemini-2.5-pro",
   "api_key": "",
-  "base_url": "",
-  "annotation_path": "",
-  "output_dir": "",
+  "base_url": "https://yunwu.ai/v1",
+  "annotation_path": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/dataset/SportsTime/basketball_first5_enriched.json",
+  "output_dir": "/home/guoxiangyu/pytorch_project/ActiveVideoPerception/avp/out/gemini_yunwu_first5",
   "default_media_resolution": "medium",
   "prefer_compressed": true,
   "debug": false,

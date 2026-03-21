@@ -17,7 +17,7 @@ Note: location can be a single string (converted to list) or a list of strings.
 For each sample, use config.get_random_location() to randomly select a location.
 
 Env overrides (if fields missing):
-- VERTEX_PROJECT, VERTEX_LOCATION, GEMINI_MODEL, GEMINI_API_KEY
+- VERTEX_PROJECT, VERTEX_LOCATION, GEMINI_MODEL, GEMINI_API_KEY, GEMINI_BASE_URL
 """
 
 from __future__ import annotations
@@ -38,10 +38,12 @@ class AVPConfig:
     plan_replan_model: str = ""  # Model for planning and replanning (empty = use model field)
     execute_model: str = ""  # Model for video inference/execution (empty = use model field)
     api_key: str = ""  # If set, use Google AI API key (e.g. from Google AI Studio); else use Vertex AI. Prefer GEMINI_API_KEY env.
+    base_url: str = ""  # Optional custom Gemini-compatible endpoint base URL. Prefer GEMINI_BASE_URL env.
     annotation_path: str = ""
     output_dir: str = ""
     default_media_resolution: str = "medium"  # low|medium|high
     prefer_compressed: bool = True
+    keep_temp_clips: bool = False
     debug: bool = False
     
     # Max frame settings for media resolution
@@ -96,6 +98,7 @@ class AVPConfig:
             cfg.model = env_model  # Also set legacy field
         # API key: env overrides config so production can use env-only
         cfg.api_key = os.getenv("GEMINI_API_KEY", cfg.api_key or "")
+        cfg.base_url = os.getenv("GEMINI_BASE_URL", cfg.base_url or "")
         # Ensure location is properly initialized as a list
         cfg.__post_init__()
         return cfg
@@ -117,5 +120,3 @@ def load_config(path: Optional[str]) -> AVPConfig:
     if not isinstance(data, dict):
         raise ValueError("Config JSON must be an object")
     return AVPConfig.from_dict(data)
-
-

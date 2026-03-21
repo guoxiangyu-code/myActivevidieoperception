@@ -74,12 +74,249 @@ from .prompt import (
     MCQ_SCHEMA,
 )
 
+def is_mcq_options(options: Optional[List[str]]) -> bool:
+    """Return True when the current query should use MCQ synthesis."""
+    return bool(options)
+
+
+def normalize_final_answer_output(
+    answer_data: Optional[Dict[str, Any]],
+    response_text: str,
+    query_confidence: float,
+    options: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Normalize final synthesis output into MCQ or open-ended shape."""
+    if is_mcq_options(options):
+        if answer_data and validate_against_schema(answer_data, MCQ_SCHEMA):
+            normalized = dict(answer_data)
+        else:
+            normalized = {
+                "selected_option": "A",
+                "confidence": query_confidence,
+                "reasoning": response_text[:500],
+                "selected_option_text": response_text[:200] if response_text else "",
+            }
+    else:
+        if answer_data and validate_against_schema(answer_data, FINAL_ANSWER_SCHEMA):
+            normalized = dict(answer_data)
+        else:
+            normalized = {
+                "answer": response_text[:200].strip() if response_text else "",
+                "key_timestamps": [],
+                "confidence": query_confidence,
+                "evidence_summary": response_text[:500],
+            }
+    normalized["query_confidence"] = query_confidence
+    return normalized
+
+
+def _is_opening_duration_query(query: str) -> bool:
+    """Return True for queries asking how long an opening sequence took."""
+    q = (query or "").lower()
+    opening_terms = ["opening", "beginning", "start of the game", "比赛开局", "开局", "开场", "比赛开始"]
+    duration_terms = ["how long", "多久", "多少时间", "多长时间", "花了多少时间", "花了多长时间", "耗时", "才取得"]
+    cumulative_terms = ["reach", "achieve", "until", "lead", "score", "领先", "取得", "得到前", "8-0"]
+    return (
+        any(term in q for term in opening_terms)
+        and any(term in q for term in duration_terms)
+        and any(term in q for term in cumulative_terms)
+    )
+
+
+def _minimum_opening_window_end(video_meta: Dict[str, Any]) -> float:
+    """Compute a conservative opening window for cumulative opening-duration queries."""
+    min_end = 240.0
+    ref_duration = video_meta.get("reference_duration_sec")
+    if isinstance(ref_duration, (int, float)) and ref_duration > 0:
+        min_end = max(min_end, float(ref_duration) + 120.0)
+
+    duration = (
+        video_meta.get("duration_sec")
+        or video_meta.get("duration")
+        or video_meta.get("video_duration_sec")
+    )
+    if isinstance(duration, (int, float)) and duration > 0:
+        return min(float(duration), min_end)
+    return min_end
+
+
+def _evidence_indicates_incomplete_coverage(evidence_list: List["Evidence"]) -> Optional[str]:
+    """Detect when observer evidence explicitly says the decisive info lies outside the watched window."""
+    incomplete_patterns = [
+        re.compile(r'no relevant information found in this time segment', re.IGNORECASE),
+        re.compile(r'(need|requires?) (to )?(analy[sz]e|inspect).*(after|outside|later)', re.IGNORECASE),
+        re.compile(r'(after|outside) (this|the) (segment|clip|window|time range)', re.IGNORECASE),
+        re.compile(r'not (fully )?(contained|included|presented) in this (segment|clip|window|time range)', re.IGNORECASE),
+        re.compile(r'cannot (yet )?determine', re.IGNORECASE),
+        re.compile(r'本视频片段.*之后'),
+        re.compile(r'此时间段.*之外'),
+        re.compile(r'并未.*完整'),
+        re.compile(r'需要对.*之后.*进行分析'),
+        re.compile(r'后续.*(得分|事件|内容).*之后'),
+        re.compile(r'无法确定'),
+    ]
+
+    for ev in evidence_list:
+        text = "\n".join(
+            part.strip()
+            for part in [getattr(ev, "detailed_response", ""), getattr(ev, "reasoning", "")]
+            if isinstance(part, str) and part.strip()
+        )
+        if not text:
+            continue
+        for pattern in incomplete_patterns:
+            if pattern.search(text):
+                return "Observer evidence indicates the decisive information lies outside the currently observed window."
+    return None
+
+
+def _normalize_key_evidence_to_canonical_timebase(
+    key_evidence: List[Dict[str, Any]],
+    media_inputs: List[Dict[str, Any]],
+    duration_sec: Optional[float],
+    debug: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Convert clearly clip-local observer timestamps into canonical raw-video seconds."""
+    normalization = {
+        "applied": False,
+        "conversion": "none",
+        "canonical_reference": "raw_video_seconds",
+    }
+    if not key_evidence or not media_inputs:
+        return key_evidence, normalization
+
+    clip_inputs = [
+        media_input for media_input in media_inputs
+        if media_input.get("clip_time_base") == "clip_local_seconds"
+    ]
+    if len(clip_inputs) != 1:
+        return key_evidence, normalization
+
+    clip_input = clip_inputs[0]
+    clip_start = clip_input.get("absolute_start_sec")
+    clip_end = clip_input.get("absolute_end_sec")
+    if not isinstance(clip_start, (int, float)) or not isinstance(clip_end, (int, float)):
+        return key_evidence, normalization
+
+    clip_start = float(clip_start)
+    clip_end = float(clip_end)
+    clip_duration = clip_end - clip_start
+    if clip_start <= 0 or clip_duration <= 0:
+        return key_evidence, normalization
+
+    numeric_ranges: List[Tuple[float, float]] = []
+    for ev_item in key_evidence:
+        if not isinstance(ev_item, dict):
+            continue
+        ts_start = ev_item.get("timestamp_start")
+        ts_end = ev_item.get("timestamp_end")
+        if isinstance(ts_start, (int, float)) and isinstance(ts_end, (int, float)):
+            numeric_ranges.append((float(ts_start), float(ts_end)))
+    if not numeric_ranges:
+        return key_evidence, normalization
+
+    tol = 1.0
+    all_within_clip_local = all(
+        (-tol) <= ts_start <= (clip_duration + tol) and (-tol) <= ts_end <= (clip_duration + tol)
+        for ts_start, ts_end in numeric_ranges
+    )
+    any_before_absolute_window = any(ts_end < (clip_start - tol) for _, ts_end in numeric_ranges)
+    if not (all_within_clip_local and any_before_absolute_window):
+        return key_evidence, normalization
+
+    shifted_key_evidence: List[Dict[str, Any]] = []
+    for ev_item in key_evidence:
+        if not isinstance(ev_item, dict):
+            shifted_key_evidence.append(ev_item)
+            continue
+        shifted_item = dict(ev_item)
+        ts_start = shifted_item.get("timestamp_start")
+        ts_end = shifted_item.get("timestamp_end")
+        if isinstance(ts_start, (int, float)) and isinstance(ts_end, (int, float)):
+            shifted_start = float(ts_start) + clip_start
+            shifted_end = float(ts_end) + clip_start
+            if isinstance(duration_sec, (int, float)) and duration_sec > 0:
+                shifted_start = max(0.0, min(float(duration_sec), shifted_start))
+                shifted_end = max(0.0, min(float(duration_sec), shifted_end))
+            shifted_item["timestamp_start"] = shifted_start
+            shifted_item["timestamp_end"] = shifted_end
+        shifted_key_evidence.append(shifted_item)
+
+    normalization = {
+        "applied": True,
+        "conversion": "clip_local_seconds_to_raw_video_seconds",
+        "canonical_reference": "raw_video_seconds",
+        "shift_sec": clip_start,
+        "source_clip_start_sec": clip_start,
+        "source_clip_end_sec": clip_end,
+    }
+    if debug:
+        print(
+            f"🕒 Converted observer timestamps from clip-local to raw-video seconds "
+            f"using offset +{clip_start:.1f}s"
+        )
+    return shifted_key_evidence, normalization
+
+
+def _apply_temporal_plan_guards(
+    plan: "PlanSpec",
+    query: str,
+    video_meta: Dict[str, Any],
+    debug: bool = False,
+) -> "PlanSpec":
+    """Apply deterministic guards on top of the planner output."""
+    if not _is_opening_duration_query(query):
+        return plan
+
+    if plan.watch.load_mode == "uniform":
+        return plan
+
+    min_end = _minimum_opening_window_end(video_meta)
+    regions = list(plan.watch.regions or [])
+    if regions:
+        earliest_start = min(float(start) for start, _ in regions)
+        latest_end = max(float(end) for _, end in regions)
+    else:
+        earliest_start = 0.0
+        latest_end = 0.0
+
+    if earliest_start > 10.0 or latest_end >= min_end:
+        return plan
+
+    adjusted_watch = dataclasses.replace(
+        plan.watch,
+        load_mode="region",
+        regions=[(0.0, float(min_end))],
+    )
+
+    adjusted_description = plan.description or "Broaden opening-window observation to cover the full cumulative opening event."
+    adjusted_criteria = plan.completion_criteria or ""
+    if adjusted_criteria:
+        adjusted_criteria += " "
+    adjusted_criteria += f"Ensure the opening segment is observed through at least {int(min_end)}s before stopping."
+
+    if debug:
+        print(
+            f"🛡️  Expanded opening-duration plan window to [0, {min_end:.1f}]s "
+            f"for cumulative opening-event coverage."
+        )
+
+    return dataclasses.replace(
+        plan,
+        watch=adjusted_watch,
+        description=adjusted_description,
+        completion_criteria=adjusted_criteria,
+    )
+
+
 # Import video utilities
 from .video_utils import (
     VideoMetadataExtractor,
     get_mime_type,
     find_compressed_video_fallback,
+    resolve_video_path,
     create_video_clip,  # For creating video clips in region mode
+    create_reencoded_video_clip,
     round_intervals_full_seconds,
 )
 
@@ -290,6 +527,30 @@ class Store:
     def append_history(self, event: Dict[str, Any]) -> None:
         with open(self.history, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    @property
+    def role_traces(self) -> pathlib.Path:
+        return self.root / "role_traces.jsonl"
+
+    def append_role_trace(
+        self,
+        role: str,
+        round_id: int,
+        prompt_text: str,
+        raw_response: str,
+        parsed_output: Any = None,
+    ) -> None:
+        """Append one prompt+response record for a named agent role."""
+        entry = {
+            "ts": now_iso(),
+            "role": role,
+            "round_id": round_id,
+            "prompt_text": prompt_text,
+            "raw_response": raw_response,
+            "parsed_output": parsed_output,
+        }
+        with open(self.role_traces, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     
     def get_interaction_history(self) -> List[Dict[str, Any]]:
         """Get interaction history as a structured list.
@@ -319,6 +580,7 @@ class Store:
         """Save complete conversation history including all interactions."""
         history = {
             "query": query,
+            "runtime_metadata": dict(bb.meta),
             "plan": {
                 "reasoning": plan.completion_criteria,
                 "description": plan.description,
@@ -347,12 +609,26 @@ class Store:
                     "detailed_response": evidence.detailed_response,
                     "reasoning": evidence.reasoning,
                     "key_evidence": evidence.key_evidence,
-                    "frames_used": evidence.frames_used
+                    "frames_used": evidence.frames_used,
+                    "model_call": evidence.model_call,
                 },
                 "timestamp": evidence.timestamp
             }
             history["execution_history"].append(exec_entry)
-        
+
+        # Embed role traces if file exists
+        role_traces = []
+        if self.role_traces.exists():
+            with open(self.role_traces, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            role_traces.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+        history["role_traces"] = role_traces
+
         self.write_json(self.conversation_history, history)
 
 
@@ -365,10 +641,13 @@ class GeminiClient:
         project: str = "my-project",
         location: str = "us-central1",
         api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
         debug: bool = False,
         max_frame_low: int = 512,
         max_frame_medium: int = 128,
         max_frame_high: int = 128,
+        prefer_compressed: bool = True,
+        keep_temp_clips: bool = False,
     ):
         # Support separate models for plan/replan vs execute
         # If not specified, use the legacy 'model' parameter for both
@@ -379,25 +658,60 @@ class GeminiClient:
         self.project = project
         self.location = location
         self.api_key = api_key or ""
+        self.base_url = (base_url or os.getenv("GEMINI_BASE_URL", "")).strip()
         self.client = None
         self.debug = debug
         self.max_frame_low = max_frame_low
         self.max_frame_medium = max_frame_medium
         self.max_frame_high = max_frame_high
+        self.prefer_compressed = prefer_compressed
+        self.keep_temp_clips = keep_temp_clips
         self.created_clips = []  # Track clips created during execution
         self.temp_clips_dir = None  # Will be set by Controller to be unique per job/worker
 
     def initialize_client(self):
         """Initialize the Gemini client (API key or Vertex AI)."""
         try:
+            http_options = None
+            if self.base_url:
+                # When a custom base_url is provided, the SDK's default api_version
+                # ("v1beta") gets double-prefixed onto the URL.  We override it:
+                # • If base_url already ends with a version segment (/v1, /v1beta …)
+                #   we set api_version="" so the SDK adds no extra prefix.
+                # • Otherwise we set api_version="v1" to get the standard /v1/ path.
+                import re as _re
+                if _re.search(r'/v\d+(?:beta)?$', self.base_url.rstrip('/')):
+                    _api_ver = ""
+                else:
+                    _api_ver = "v1"
+                http_options = types.HttpOptions(baseUrl=self.base_url, api_version=_api_ver)
             if self.api_key:
-                self.client = genai.Client(api_key=self.api_key)
+                if http_options is not None:
+                    self.client = genai.Client(api_key=self.api_key, http_options=http_options)
+                else:
+                    self.client = genai.Client(api_key=self.api_key)
                 if self.debug:
-                    print("✅ Initialized Gemini client (API key)")
+                    if self.base_url:
+                        print(f"✅ Initialized Gemini client (API key, base_url={self.base_url})")
+                    else:
+                        print("✅ Initialized Gemini client (API key)")
             else:
-                self.client = genai.Client(vertexai=True, project=self.project, location=self.location)
+                kwargs: Dict[str, Any] = {
+                    "vertexai": True,
+                    "project": self.project,
+                    "location": self.location,
+                }
+                if http_options is not None:
+                    kwargs["http_options"] = http_options
+                self.client = genai.Client(**kwargs)
                 if self.debug:
-                    print(f"✅ Initialized Vertex AI client for project: {self.project} @ {self.location}")
+                    if self.base_url:
+                        print(
+                            f"✅ Initialized Vertex AI client for project: {self.project} @ {self.location} "
+                            f"(base_url={self.base_url})"
+                        )
+                    else:
+                        print(f"✅ Initialized Vertex AI client for project: {self.project} @ {self.location}")
         except Exception as e:
             print(f"❌ Failed to initialize Gemini client: {e}")
             raise
@@ -427,9 +741,10 @@ class GeminiClient:
         Returns:
             Gemini Part object with video blob and metadata
         """
-        # Try to find compressed version first
-        compressed_path = find_compressed_video_fallback(video_path)
-        actual_video_path = compressed_path if compressed_path else video_path
+        actual_video_path, compressed_path = resolve_video_path(
+            video_path,
+            prefer_compressed=self.prefer_compressed,
+        )
         
         if not os.path.exists(actual_video_path):
             raise FileNotFoundError(f"Video file not found: {actual_video_path}")
@@ -526,7 +841,7 @@ class GeminiClient:
         return str(rate).strip().lower()
 
 
-    def plan(self, query: str, video_meta: Dict[str, Any] = None, prior: Optional[Blackboard] = None, options: Optional[List[str]] = None) -> PlanSpec:
+    def plan(self, query: str, video_meta: Dict[str, Any] = None, prior: Optional[Blackboard] = None, options: Optional[List[str]] = None, store: "Store" = None, round_id: int = 0) -> PlanSpec:
         """Generate observation action plan using LLM.
         
         For initial planning: generates a single observation action based on query and video metadata.
@@ -578,6 +893,11 @@ class GeminiClient:
             contents=prompt
         )
         response_text = getattr(resp, "text", str(resp))
+
+        # --- role trace ---
+        if store is not None:
+            role = "planner_replan" if is_replan else "planner"
+            store.append_role_trace(role, round_id, prompt, response_text)
         
         if self.debug:
             print(f"\n{'='*80}")
@@ -656,6 +976,7 @@ class GeminiClient:
                 description=s.get("description", ""),
                 completion_criteria=plan_data.get("completion_criteria", ""),
             )
+            plan = _apply_temporal_plan_guards(plan, query, video_meta, debug=self.debug)
             
             if self.debug:
                 print(f"\n{'='*80}")
@@ -702,6 +1023,12 @@ class GeminiClient:
         watch_cfg: WatchConfig,
         step_id: str,
         original_query: str = "",
+        source_video_path: str = "",
+        resolved_video_path: str = "",
+        time_base: str = "",
+        temporal_hint_summary: str = "",
+        store: "Store" = None,
+        round_id: int = 0,
     ) -> Evidence:
         """Query Gemini with video file directly (no frame extraction needed).
         
@@ -729,6 +1056,9 @@ class GeminiClient:
         # Get video duration for prompt
         meta_extractor = VideoMetadataExtractor(video_path)
         video_duration = meta_extractor.duration
+        resolved_input_path = resolved_video_path or video_path
+        source_input_path = source_video_path or video_path
+        media_inputs: List[Dict[str, Any]] = []
 
         # Handle multiple regions: create clips for each region and pass all to API
         parts = []
@@ -755,7 +1085,10 @@ class GeminiClient:
                     video_path=video_path,
                     start_time=reg_start,
                     end_time=reg_end,
-                    clip_name=f"step_{step_id}_region_{region_idx}",
+                    clip_name=(
+                        f"step_{step_id}_region_{region_idx}_"
+                        f"{int(round(reg_start * 1000))}_{int(round(reg_end * 1000))}"
+                    ),
                     temp_dir=clip_dir,
                     debug=self.debug
                 )
@@ -775,6 +1108,15 @@ class GeminiClient:
                     parts.append(part)
                     clip_paths.append(clip_path)
                     frames_used.append({"start": reg_start, "end": reg_end, "fps": fps})
+                    media_inputs.append({
+                        "input_type": "clip",
+                        "source_video_path": source_input_path,
+                        "resolved_video_path": resolved_input_path,
+                        "clip_path": clip_path,
+                        "absolute_start_sec": reg_start,
+                        "absolute_end_sec": reg_end,
+                        "clip_time_base": "clip_local_seconds",
+                    })
                     # Track clips for cleanup
                     self.created_clips.append(clip_path)
                     if self.debug:
@@ -792,6 +1134,14 @@ class GeminiClient:
                     )
                     parts.append(part)
                     frames_used.append({"start": reg_start, "end": reg_end, "fps": fps})
+                    media_inputs.append({
+                        "input_type": "offset_window",
+                        "source_video_path": source_input_path,
+                        "resolved_video_path": resolved_input_path,
+                        "absolute_start_sec": reg_start,
+                        "absolute_end_sec": reg_end,
+                        "clip_time_base": "raw_video_seconds",
+                    })
             
             # Use the first region's range for prompt context (or compute overall range)
             if clip_paths or parts:
@@ -812,6 +1162,14 @@ class GeminiClient:
                 )
                 parts = [part]
                 frames_used = [{"start": start_sec, "end": end_sec, "fps": fps}]
+                media_inputs.append({
+                    "input_type": "offset_window",
+                    "source_video_path": source_input_path,
+                    "resolved_video_path": resolved_input_path,
+                    "absolute_start_sec": start_sec,
+                    "absolute_end_sec": end_sec,
+                    "clip_time_base": "raw_video_seconds",
+                })
         elif watch_cfg.load_mode == "region" and start_sec is not None and end_sec is not None:
             # Single region mode: create one clip or use offsets
             if start_sec >= end_sec:
@@ -846,6 +1204,15 @@ class GeminiClient:
                 parts = [part]
                 clip_paths = [clip_path]
                 frames_used = [{"start": start_sec, "end": end_sec, "fps": fps}]
+                media_inputs.append({
+                    "input_type": "clip",
+                    "source_video_path": source_input_path,
+                    "resolved_video_path": resolved_input_path,
+                    "clip_path": clip_path,
+                    "absolute_start_sec": start_sec,
+                    "absolute_end_sec": end_sec,
+                    "clip_time_base": "clip_local_seconds",
+                })
                 # Track this clip for cleanup
                 self.created_clips.append(clip_path)
                 if self.debug:
@@ -863,17 +1230,103 @@ class GeminiClient:
                 )
                 parts = [part]
                 frames_used = [{"start": start_sec, "end": end_sec, "fps": fps}]
+                media_inputs.append({
+                    "input_type": "offset_window",
+                    "source_video_path": source_input_path,
+                    "resolved_video_path": resolved_input_path,
+                    "absolute_start_sec": start_sec,
+                    "absolute_end_sec": end_sec,
+                    "clip_time_base": "raw_video_seconds",
+                })
         else:
             # For uniform mode, use offsets as normal
-            part = self.create_video_part(
-                video_path=video_path,
-                fps=fps,
-                start_offset=f"{start_sec}s" if start_sec > 0 else None,
-                end_offset=f"{end_sec}s" if end_sec > 0 else None,
-                media_resolution=media_res,
+            use_reencoded_uniform_clip = (
+                watch_cfg.load_mode == "uniform"
+                and isinstance(duration_sec, (int, float))
+                and float(duration_sec) >= 900.0
             )
-            parts = [part]
-            frames_used = [{"start": start_sec, "end": end_sec, "fps": fps}]
+            if use_reencoded_uniform_clip:
+                clip_dir = self.temp_clips_dir if self.temp_clips_dir else os.path.join(os.path.dirname(video_path), "temp_clips")
+                if media_res == "low":
+                    scale_width = 480
+                    video_bitrate = "220k"
+                    audio_bitrate = None
+                    frame_rate = 6.0
+                    crf = 32
+                elif media_res == "medium":
+                    scale_width = 640
+                    video_bitrate = "320k"
+                    audio_bitrate = "32k"
+                    frame_rate = 8.0
+                    crf = 30
+                else:
+                    scale_width = 854
+                    video_bitrate = "550k"
+                    audio_bitrate = "48k"
+                    frame_rate = 10.0
+                    crf = 28
+
+                clip_path = create_reencoded_video_clip(
+                    video_path=video_path,
+                    start_time=start_sec,
+                    end_time=end_sec,
+                    clip_name=(
+                        f"step_{step_id}_uniform_reencoded_"
+                        f"{int(round(start_sec * 1000))}_{int(round(end_sec * 1000))}"
+                    ),
+                    temp_dir=clip_dir,
+                    scale_width=scale_width,
+                    video_bitrate=video_bitrate,
+                    audio_bitrate=audio_bitrate,
+                    frame_rate=frame_rate,
+                    crf=crf,
+                    debug=self.debug,
+                )
+            else:
+                clip_path = None
+
+            if clip_path:
+                part = self.create_video_part(
+                    video_path=clip_path,
+                    fps=fps,
+                    start_offset=None,
+                    end_offset=None,
+                    media_resolution=media_res,
+                    duration_sec=end_sec - start_sec,
+                )
+                parts = [part]
+                clip_paths = [clip_path]
+                frames_used = [{"start": start_sec, "end": end_sec, "fps": fps}]
+                media_inputs.append({
+                    "input_type": "reencoded_full_range_clip",
+                    "source_video_path": source_input_path,
+                    "resolved_video_path": resolved_input_path,
+                    "clip_path": clip_path,
+                    "absolute_start_sec": start_sec,
+                    "absolute_end_sec": end_sec,
+                    "clip_time_base": "raw_video_seconds",
+                })
+                self.created_clips.append(clip_path)
+                if self.debug:
+                    print(f"📹 Using re-encoded uniform clip: {clip_path} (range: {start_sec:.1f}s - {end_sec:.1f}s)")
+            else:
+                part = self.create_video_part(
+                    video_path=video_path,
+                    fps=fps,
+                    start_offset=f"{start_sec}s" if start_sec > 0 else None,
+                    end_offset=f"{end_sec}s" if end_sec > 0 else None,
+                    media_resolution=media_res,
+                )
+                parts = [part]
+                frames_used = [{"start": start_sec, "end": end_sec, "fps": fps}]
+                media_inputs.append({
+                    "input_type": "offset_window" if start_sec or end_sec else "full_video",
+                    "source_video_path": source_input_path,
+                    "resolved_video_path": resolved_input_path,
+                    "absolute_start_sec": start_sec,
+                    "absolute_end_sec": end_sec,
+                    "clip_time_base": "raw_video_seconds",
+                })
         
         # Determine if this is a region mode
         is_region = (len(clip_paths) > 0) or (watch_cfg.load_mode == "region")
@@ -892,7 +1345,10 @@ class GeminiClient:
             original_query=original_query,
             video_duration_sec=video_duration,
             is_region=is_region,
-            regions=regions_for_prompt
+            regions=regions_for_prompt,
+            media_inputs=media_inputs,
+            time_base=time_base,
+            temporal_hint_summary=temporal_hint_summary,
         )
         
         if self.debug:
@@ -942,10 +1398,12 @@ class GeminiClient:
                 contents=contents
             )
         response_text = getattr(resp, "text", str(resp))
-        
-        # Try to parse structured JSON response
         evidence_data = parse_json_response(response_text)
-        
+
+        # --- role trace ---
+        if store is not None:
+            store.append_role_trace("observer", round_id, prompt, response_text)
+
         if evidence_data and validate_against_schema(evidence_data, EVIDENCE_SCHEMA):
             # Use structured response - support both old and new formats
             summary = evidence_data.get("summary") or evidence_data.get("detailed_response", response_text)
@@ -982,6 +1440,13 @@ class GeminiClient:
                 key_evidence = [{"timestamp_start": max(0.0, t - 1.0), "timestamp_end": t + 1.0, "description": ""} for t in time_anchors]
                 if self.debug:
                     print(f"⚠️  Using fallback parsing: {len(key_evidence)} items")
+
+        key_evidence, time_normalization = _normalize_key_evidence_to_canonical_timebase(
+            key_evidence=key_evidence,
+            media_inputs=media_inputs,
+            duration_sec=duration_sec,
+            debug=self.debug,
+        )
         
         # Normalize key_evidence to full-second intervals using floor for start and ceil for end
         # Clamp to [0, duration_sec] and drop invalid/zero-length intervals; deduplicate
@@ -1023,7 +1488,12 @@ class GeminiClient:
             "model": self.execute_model,
             "fps": fps,
             "media_resolution": media_res,
-            "prompt_version": "v2_structured"
+            "prompt_version": "v2_structured",
+            "source_video_path": source_input_path,
+            "resolved_video_path": resolved_input_path,
+            "time_base": time_base or "raw_video_seconds",
+            "media_inputs": media_inputs,
+            "time_normalization": time_normalization,
         }
         
         # Add region information to metadata
@@ -1034,6 +1504,8 @@ class GeminiClient:
             if frames_used:
                 model_call_metadata["start_offset"] = f"{frames_used[0]['start']}s" if frames_used[0]['start'] > 0 else None
                 model_call_metadata["end_offset"] = f"{frames_used[0]['end']}s" if frames_used[0]['end'] > 0 else None
+        if clip_paths:
+            model_call_metadata["clip_paths"] = clip_paths
         
         return Evidence(
             detailed_response=detailed_response,
@@ -1179,7 +1651,7 @@ class GeminiClient:
 
     # Legacy replan helpers removed in simplified loop
 
-    def synthesize_final_answer(self, plan: PlanSpec, bb: Blackboard) -> Dict[str, Any]:
+    def synthesize_final_answer(self, plan: PlanSpec, bb: Blackboard, store: "Store" = None, round_id: int = 0) -> Dict[str, Any]:
         """Synthesize final answer from all evidence.
         
         Args:
@@ -1187,7 +1659,7 @@ class GeminiClient:
             bb: Blackboard with all evidence
             
         Returns:
-            Dictionary with final answer and metadata (MCQ format)
+            Dictionary with final answer and metadata.
         """
         if self.client is None:
             self.initialize_client()
@@ -1196,12 +1668,14 @@ class GeminiClient:
         options = bb.meta.get("options", None)
         options_list = options if options else []
         
-        # Generate prompt using PromptManager (always uses MCQ format)
+        # Generate prompt using PromptManager
         prompt = PromptManager.get_synthesis_prompt(
             original_query=plan.query,
             all_evidence=bb.summary_text(),
             video_duration=bb.duration_sec or 0.0,
-            options=options_list
+            options=options_list,
+            time_base=str(bb.meta.get("time_base", "") or ""),
+            temporal_hint_summary=str(bb.meta.get("temporal_hint_summary", "") or ""),
         )
         
         if self.debug:
@@ -1209,7 +1683,7 @@ class GeminiClient:
             if options_list:
                 print(f"📝 MCQ format with {len(options_list)} options")
             else:
-                print(f"📝 MCQ format (open-ended question)")
+                print(f"📝 Open-ended format")
         
         # Call LLM using plan_replan_model for final answer synthesis (reasoning task)
         resp = self.client.models.generate_content(
@@ -1217,32 +1691,24 @@ class GeminiClient:
             contents=prompt
         )
         response_text = getattr(resp, "text", str(resp))
-        
+
+        # --- role trace ---
+        if store is not None:
+            store.append_role_trace("synthesizer", round_id, prompt, response_text)
+
         # Try to parse structured JSON response
         answer_data = parse_json_response(response_text)
-        
-        # Always use MCQ_SCHEMA for validation
-        if answer_data and validate_against_schema(answer_data, MCQ_SCHEMA):
-            # Use structured response
-            # Add query-level confidence if available from Blackboard
-            if bb.query_confidence is not None:
-                answer_data["query_confidence"] = bb.query_confidence
-            if self.debug:
-                print(f"✅ Parsed structured final answer (MCQ format)")
-            return answer_data
-        else:
-            # Fallback: return text as-is in MCQ format
-            if self.debug:
-                print(f"⚠️  Using unstructured final answer (converted to MCQ format)")
-            # Use query-level confidence from Blackboard if available
-            query_confidence = bb.query_confidence if bb.query_confidence is not None else 0.5
-            return {
-                "selected_option": "A",
-                "confidence": query_confidence,
-                "query_confidence": query_confidence,
-                "reasoning": response_text[:500],
-                "selected_option_text": response_text[:200] if response_text else ""
-            }
+
+        query_confidence = bb.query_confidence if bb.query_confidence is not None else 0.5
+        normalized = normalize_final_answer_output(
+            answer_data=answer_data,
+            response_text=response_text,
+            query_confidence=query_confidence,
+            options=options_list,
+        )
+        if self.debug:
+            print(f"✅ Parsed final answer in {'MCQ' if options_list else 'open-ended'} format")
+        return normalized
 
 
 # ======================================================
@@ -1273,13 +1739,13 @@ class Planner:
     def __init__(self, client: GeminiClient):
         self.client = client
 
-    def initial_plan(self, query: str, video_meta: Dict[str, Any] = None, options: Optional[List[str]] = None) -> PlanSpec:
+    def initial_plan(self, query: str, video_meta: Dict[str, Any] = None, options: Optional[List[str]] = None, store: "Store" = None, round_id: int = 0) -> PlanSpec:
         """Generate initial observation action plan.
         
         This is the "plan" phase of the plan-observe-verify framework.
         Creates a single observation action plan (query + watch config).
         """
-        return self.client.plan(query, video_meta, options=options)
+        return self.client.plan(query, video_meta, options=options, store=store, round_id=round_id)
 
     # Legacy update_plan removed in simplified loop
 
@@ -1325,7 +1791,7 @@ class Observer:
         else:
             raise ValueError(f"Unknown load_mode: {watch.load_mode}")
 
-    def observe(self, plan: PlanSpec, bb: Blackboard) -> Evidence:
+    def observe(self, plan: PlanSpec, bb: Blackboard, store: "Store" = None, round_id: int = 0) -> Evidence:
         """Observe the video segment specified by the plan and gather evidence.
         
         This is the "observe" phase of the plan-observe-verify framework.
@@ -1377,6 +1843,10 @@ class Observer:
             print(f"{'='*80}")
             print(f"Query: {query_to_use[:200]}...")
             print(f"Video: {bb.video_path}")
+            if bb.meta.get("source_video_path") and bb.meta.get("source_video_path") != bb.video_path:
+                print(f"Source Video: {bb.meta.get('source_video_path')}")
+            if bb.meta.get("time_base"):
+                print(f"Time Base: {bb.meta.get('time_base')}")
             print(f"Time Range: {start_sec:.1f}s - {end_sec:.1f}s")
             print(f"Load Mode: {watch_cfg.load_mode}")
             print(f"FPS: {watch_cfg.fps}")
@@ -1395,7 +1865,13 @@ class Observer:
                 end_sec=end_sec,
                 watch_cfg=watch_cfg,
                 step_id="1",  # Always "1" in single-action mode
-                original_query=plan.query
+                original_query=plan.query,
+                source_video_path=str(bb.meta.get("source_video_path", bb.video_path)),
+                resolved_video_path=bb.video_path,
+                time_base=str(bb.meta.get("time_base", "") or ""),
+                temporal_hint_summary=str(bb.meta.get("temporal_hint_summary", "") or ""),
+                store=store,
+                round_id=round_id,
             )
         
         if self.client.debug:
@@ -1415,7 +1891,6 @@ class Observer:
             print(f"Reasoning: {ev.reasoning[:200]}...")
             print(f"{'='*80}\n")
         
-        bb.add_evidence(ev)
         return ev
 
 
@@ -1437,8 +1912,12 @@ class Reflector:
         interaction_history: List[Dict[str, Any]] = None,
         video_path: str = "",
         duration_sec: Optional[float] = None,
+        time_base: str = "",
+        temporal_hint_summary: str = "",
         is_last_round: bool = False,
         options: Optional[List[str]] = None,
+        store: "Store" = None,
+        round_id: int = 0,
     ) -> Dict[str, Any]:
         """Reflect on the current state and decide on next actions.
         
@@ -1487,12 +1966,14 @@ class Reflector:
             # Normalize options to empty list if None
             options_list = options if options else []
             
-            # Generate synthesis prompt (always uses MCQ format for QA)
+            # Generate synthesis prompt using MCQ or open-ended schema as appropriate
             prompt = PromptManager.get_synthesis_prompt(
                 original_query=query,
                 all_evidence=context_text,
                 video_duration=duration_sec or 0.0,
-                options=options_list
+                options=options_list,
+                time_base=time_base,
+                temporal_hint_summary=temporal_hint_summary,
             )
             
             # Call LLM using plan_replan_model for final answer synthesis
@@ -1504,38 +1985,31 @@ class Reflector:
                 contents=prompt
             )
             response_text = getattr(resp, "text", str(resp))
+
+            # --- role trace ---
+            if store is not None:
+                store.append_role_trace("reflector_synthesizer", round_id, prompt, response_text)
             
             # Try to parse structured JSON response
             answer_data = parse_json_response(response_text)
             
-            # Always use MCQ_SCHEMA for validation
-            if answer_data and validate_against_schema(answer_data, MCQ_SCHEMA):
-                # Use structured response
+            if answer_data and "confidence" in answer_data:
                 query_confidence = answer_data.get("confidence", 0.5)
-                if self.client.debug:
-                    print(f"✅ Parsed structured final answer (MCQ format)")
             else:
-                # Fallback: return text as-is in MCQ format
-                if self.client.debug:
-                    print(f"⚠️  Using unstructured final answer (converted to MCQ format)")
                 query_confidence = 0.5
-                answer_data = {
-                    "selected_option": "A",
-                    "confidence": query_confidence,
-                    "reasoning": response_text[:500],
-                    "selected_option_text": response_text[:200] if response_text else ""
-                }
-            
-            # Add query_confidence to answer_data
-            answer_data["query_confidence"] = query_confidence
+            answer_data = normalize_final_answer_output(
+                answer_data=answer_data,
+                response_text=response_text,
+                query_confidence=query_confidence,
+                options=options_list,
+            )
             
             if self.client.debug:
                 print(f"\n{'='*80}")
                 print(f"✅ FINAL ANSWER GENERATED IN REFLECTION")
                 print(f"{'='*80}")
-                print(f"Selected Option: {answer_data.get('selected_option', 'N/A')}")
-                print(f"Option Text: {answer_data.get('selected_option_text', '')}")
-                print(f"Reasoning: {answer_data.get('reasoning', '')[:300]}...")
+                print(f"Answer: {answer_data.get('answer', answer_data.get('selected_option_text', ''))}")
+                print(f"Reasoning: {answer_data.get('reasoning', answer_data.get('evidence_summary', ''))[:300]}...")
                 print(f"Confidence: {answer_data.get('confidence', 0.0):.2f}")
                 print(f"{'='*80}\n")
             
@@ -1622,6 +2096,39 @@ class Reflector:
         
         # Assess sufficiency based on evidence quality (no re-watching video)
         has_evidence = any(ev.detailed_response for ev in evidence_list)
+        incomplete_coverage_reason = _evidence_indicates_incomplete_coverage(evidence_list)
+
+        if incomplete_coverage_reason:
+            result = {
+                "sufficient": False,
+                "should_update": True,
+                "updates": [],
+                "reasoning": (
+                    f"Evidence analysis: {len(evidence_list)} round(s), {len(regions)} unique region(s) after dedup/merge, "
+                    f"{sum(len(ev.key_evidence) for ev in evidence_list)} total evidence items. {incomplete_coverage_reason}"
+                ),
+                "confidence": 0.85,
+                "query_confidence": 0.35 if has_evidence else 0.2,
+                "event": "VERIFICATION",
+            }
+            if self.client.debug:
+                print(f"\n{'='*80}")
+                print(f"✅ VERIFIER OUTPUT")
+                print(f"{'='*80}")
+                print(f"Sufficient: {result['sufficient']}")
+                print(f"Query Confidence: {result['query_confidence']:.2f}")
+                print(f"Reasoning: {result['reasoning']}")
+                print(f"Decision: ❌ INSUFFICIENT - Replan")
+                print(f"{'='*80}\n")
+            if store is not None:
+                store.append_role_trace(
+                    "reflector",
+                    round_id,
+                    prompt_text="[heuristic — no LLM call]",
+                    raw_response="[heuristic — no LLM call]",
+                    parsed_output=result,
+                )
+            return result
         
         # Compute query confidence based on evidence completeness
         if has_evidence:
@@ -1666,7 +2173,17 @@ class Reflector:
             print(f"Reasoning: {result['reasoning']}")
             print(f"Decision: {'✅ SUFFICIENT - Generate Answer' if result['sufficient'] else '❌ INSUFFICIENT - Replan'}")
             print(f"{'='*80}\n")
-        
+
+        # --- role trace (heuristic reflector — no LLM call) ---
+        if store is not None:
+            store.append_role_trace(
+                "reflector",
+                round_id,
+                prompt_text="[heuristic — no LLM call]",
+                raw_response="[heuristic — no LLM call]",
+                parsed_output=result,
+            )
+
         return result
 
     # Legacy confidence/decision helpers removed in simplified loop
@@ -1680,15 +2197,28 @@ class Controller:
     2. Observe: Execute actions and gather evidence
     3. Reflect: Assess evidence sufficiency and decide on next actions
     """
-    def __init__(self, run_dir: str, video_path: str, client: GeminiClient, options: Optional[List[str]] = None):
+    def __init__(
+        self,
+        run_dir: str,
+        video_path: str,
+        client: GeminiClient,
+        options: Optional[List[str]] = None,
+        sample_metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.store = Store(run_dir)
         self.client = client
-        # Find compressed video if available
-        compressed_path = find_compressed_video_fallback(video_path)
-        actual_video_path = compressed_path if compressed_path else video_path
+        resolved_video_path, compressed_path = resolve_video_path(
+            video_path,
+            prefer_compressed=client.prefer_compressed,
+        )
         if client.debug and compressed_path:
             print(f"✅ Using compressed video: {compressed_path}")
-        self.bb = Blackboard(video_path=actual_video_path)
+        self.bb = Blackboard(video_path=resolved_video_path)
+        self.bb.meta["source_video_path"] = video_path
+        self.bb.meta["resolved_video_path"] = resolved_video_path
+        self.bb.meta["compressed_video_path"] = compressed_path
+        if sample_metadata:
+            self.bb.meta.update(sample_metadata)
         if options:
             self.bb.meta["options"] = options
         # Track clips created by this controller's client
@@ -1702,6 +2232,25 @@ class Controller:
         self._init_meta()
 
     # ---------- meta ----------
+    def _planning_video_meta(self) -> Dict[str, Any]:
+        """Build planning metadata including time-base hints when available."""
+        video_meta: Dict[str, Any] = {
+            "duration_sec": self.bb.duration_sec,
+        }
+        for key in [
+            "time_base",
+            "time_reference",
+            "reference_time_source",
+            "reference_times_sec",
+            "reference_time_range_sec",
+            "reference_duration_sec",
+            "temporal_hint_summary",
+        ]:
+            value = self.bb.meta.get(key)
+            if value not in (None, "", [], {}):
+                video_meta[key] = value
+        return video_meta
+
     def _init_meta(self) -> None:
         # Use VideoMetadataExtractor to get video info (from JSON cache - only duration needed!)
         meta_extractor = VideoMetadataExtractor(self.bb.video_path)
@@ -1709,26 +2258,35 @@ class Controller:
         
         meta = {
             "video_path": self.bb.video_path,
+            "source_video_path": self.bb.meta.get("source_video_path", self.bb.video_path),
+            "resolved_video_path": self.bb.meta.get("resolved_video_path", self.bb.video_path),
+            "compressed_video_path": self.bb.meta.get("compressed_video_path"),
             "duration_sec": self.bb.duration_sec,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "model": self.client.model,  # Legacy field
             "plan_replan_model": self.client.plan_replan_model,
             "execute_model": self.client.execute_model,
+            "prefer_compressed": self.client.prefer_compressed,
+            "keep_temp_clips": self.client.keep_temp_clips,
+            "time_base": self.bb.meta.get("time_base", ""),
+            "time_reference": self.bb.meta.get("time_reference", ""),
+            "reference_time_source": self.bb.meta.get("reference_time_source", ""),
+            "reference_times_sec": self.bb.meta.get("reference_times_sec", []),
+            "reference_time_range_sec": self.bb.meta.get("reference_time_range_sec", []),
+            "reference_duration_sec": self.bb.meta.get("reference_duration_sec"),
+            "temporal_hint_summary": self.bb.meta.get("temporal_hint_summary", ""),
             "prompt_versions": {"plan": "v2_json_metadata", "infer": "v2_structured", "update": "v2_structured", "synthesize": "v2_structured"}
         }
         self.store.write_json(self.store.meta, meta)
 
     # ---------- planning ----------
-    def plan(self, query: str) -> PlanSpec:
+    def plan(self, query: str, store: "Store" = None, round_id: int = 0) -> PlanSpec:
         """Generate initial plan with video metadata."""
         planner = Planner(self.client)
-        # Prepare video metadata for planning (only duration is needed!)
-        video_meta = {
-            "duration_sec": self.bb.duration_sec,
-        }
+        video_meta = self._planning_video_meta()
         # Get options from blackboard if available
         options = self.bb.meta.get("options", None)
-        plan = planner.initial_plan(query, video_meta, options=options)
+        plan = planner.initial_plan(query, video_meta, options=options, store=store, round_id=round_id)
         
         self.store.write_json(self.store.plan_initial, dataclasses.asdict(plan))
         self.store.append_history({
@@ -1745,6 +2303,7 @@ class Controller:
         observer = Observer(self.client)
         ev = observer.observe(plan, self.bb)
         ev.round_id = round_id
+        self.bb.add_evidence(ev)
         # Persist evidence with interval_map for readability
         ev_dict = dataclasses.asdict(ev)
         try:
@@ -1797,21 +2356,22 @@ class Controller:
             max_rounds: Maximum number of plan-observe-reflect cycles
         """
         # Plan phase: Generate initial plan if not present
-        plan = self._load_latest_plan() or self.plan(query)
+        plan = self._load_latest_plan() or self.plan(query, store=self.store, round_id=0)
         
         # Track final answer if generated in reflection
         final_answer_from_reflection = None
 
         for round_idx in range(max_rounds):
+            current_round = round_idx + 1
             if self.client.debug:
                 print(f"\n{'#'*80}")
-                print(f"🔄 ROUND {round_idx + 1} / {max_rounds}")
+                print(f"🔄 ROUND {current_round} / {max_rounds}")
                 print(f"{'#'*80}\n")
             
             # Observe: execute the observation action
             observer = Observer(self.client)
-            ev = observer.observe(plan, self.bb)
-            ev.round_id = round_idx + 1  # Set round number
+            ev = observer.observe(plan, self.bb, store=self.store, round_id=current_round)
+            ev.round_id = current_round
             self.bb.add_evidence(ev)
             ev_dict = dataclasses.asdict(ev)
             try:
@@ -1857,8 +2417,12 @@ class Controller:
                 interaction_history=interaction_history,
                 video_path=self.bb.video_path,
                 duration_sec=self.bb.duration_sec,
+                time_base=str(self.bb.meta.get("time_base", "") or ""),
+                temporal_hint_summary=str(self.bb.meta.get("temporal_hint_summary", "") or ""),
                 is_last_round=is_last_round,
                 options=options,
+                store=self.store,
+                round_id=current_round,
             )
             
             # Check if final answer was generated in reflection (last round)
@@ -1892,10 +2456,9 @@ class Controller:
                     print(f"❌ Evidence insufficient. Replanning with all evidence and history...")
                 
                 # Pass blackboard with all evidence for replanning
-                video_meta = {
-                    "duration_sec": self.bb.duration_sec,
-                }
-                plan = self.client.plan(query, video_meta=video_meta, prior=self.bb, options=options)
+                video_meta = self._planning_video_meta()
+                plan = self.client.plan(query, video_meta=video_meta, prior=self.bb, options=options,
+                                        store=self.store, round_id=current_round)
 
         # final answer
         if final_answer_from_reflection is not None:
@@ -1918,11 +2481,15 @@ class Controller:
                 print(f"Total Evidence Items: {sum(len(ev.key_evidence) for ev in self.bb.evidences)}")
                 print(f"{'='*80}\n")
             
-            final = self.client.synthesize_final_answer(plan, self.bb)
+            final = self.client.synthesize_final_answer(plan, self.bb,
+                                                         store=self.store, round_id=len(self.bb.evidences))
         
-        # Extract final answer text from MCQ format
-        # Prefer selected_option_text, fallback to reasoning
-        final_answer_text = final.get("selected_option_text", "") or final.get("reasoning", "")
+        final_answer_text = (
+            final.get("answer", "")
+            or final.get("selected_option_text", "")
+            or final.get("reasoning", "")
+            or final.get("evidence_summary", "")
+        )
         plan.final_answer = final_answer_text
         final["query"] = query  # Add query to final result
         self.store.write_json(self.store.final_answer, final)
@@ -1932,9 +2499,8 @@ class Controller:
             print(f"\n{'='*80}")
             print(f"✅ FINAL ANSWER")
             print(f"{'='*80}")
-            print(f"Selected Option: {final.get('selected_option', 'N/A')}")
-            print(f"Option Text: {final.get('selected_option_text', '')}")
-            print(f"Reasoning: {final.get('reasoning', '')[:300]}...")
+            print(f"Answer: {final.get('answer', final.get('selected_option_text', ''))}")
+            print(f"Reasoning: {final.get('reasoning', final.get('evidence_summary', ''))[:300]}...")
             print(f"Confidence: {final.get('confidence', 0.0):.2f}")
             # Print evidence timestamps if available
             evidence_timestamps = final.get('evidence_timestamps', [])

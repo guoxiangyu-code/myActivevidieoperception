@@ -76,6 +76,27 @@ EVIDENCE_SCHEMA = {
 }
 
 
+REFLECTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sufficient": {"type": "boolean", "description": "Whether the current evidence is sufficient to answer the query with confidence"},
+        "should_update": {"type": "boolean", "description": "Whether the controller should continue watching and replan"},
+        "answerability_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Confidence that the current evidence supports a reliable answer"},
+        "missing_information": {"type": "string", "description": "What is still missing from the evidence"},
+        "next_search_strategy": {"type": "string", "description": "High-level guidance for the next observation, e.g. broaden, shift, uniform, refine, stop"},
+        "reasoning": {"type": "string", "description": "Explanation of the reflection decision"}
+    },
+    "required": [
+        "sufficient",
+        "should_update",
+        "answerability_confidence",
+        "missing_information",
+        "next_search_strategy",
+        "reasoning",
+    ]
+}
+
+
 # PLAN_UPDATE_SCHEMA removed in simplified loop
 
 
@@ -116,6 +137,28 @@ MCQ_SCHEMA = {
 class PromptManager:
     """Manages all prompts for the agentic video framework."""
 
+    @staticmethod
+    def _build_temporal_context_section(video_meta: Dict[str, Any]) -> str:
+        """Format optional time-base and temporal-hint metadata for prompts."""
+        lines: List[str] = []
+
+        time_base = str(video_meta.get("time_base", "") or "").strip()
+        if time_base:
+            lines.append(f"- Time Base: {time_base}")
+
+        time_reference = str(video_meta.get("time_reference", "") or "").strip()
+        if time_reference:
+            lines.append(f"- Time Reference: {time_reference}")
+
+        temporal_hint_summary = str(video_meta.get("temporal_hint_summary", "") or "").strip()
+        if temporal_hint_summary:
+            lines.append(f"- Temporal Hint Summary: {temporal_hint_summary}")
+
+        if not lines:
+            return ""
+
+        return "\n\n    **Temporal Context / Time-Base Notes:**\n    " + "\n    ".join(lines)
+
 
     @staticmethod
     def get_planning_prompt(query: str, video_meta: Dict[str, Any], options: Optional[List[str]] = None) -> str:
@@ -141,6 +184,7 @@ class PromptManager:
             or video_meta.get("video_duration_sec")
             or "unknown"
         )
+        temporal_context_section = PromptManager._build_temporal_context_section(video_meta)
         
         # Build the full query with options if available
         full_query = query
@@ -154,6 +198,7 @@ class PromptManager:
 
     **Video Information:**
     - Duration: {duration} seconds
+{temporal_context_section}
 
     **Planning Framework:**
     Each action A_t in your plan must specify three key components:
@@ -211,7 +256,8 @@ class PromptManager:
     - For FACTUAL questions with exact timestamps: respect them precisely (no padding)
     - For REASONING/EXPLANATION questions with exact timestamps: add 15-30 seconds padding before/after to understand context
     - Only use padding/windows when the query explicitly says "around/near/about" or when timing is vague
-    
+    - If the temporal context says reference timings are dataset-local or non-authoritative, do NOT map them directly to raw-video seconds
+
     All explicit timestamps must be interpreted as seconds from the start of the original video.
 
     **Segment Length Rule:**
@@ -225,6 +271,7 @@ class PromptManager:
     - If the query mentions "opening"/"beginning", consider [0, 30].
     - If the query mentions "end"/"ending", consider [max(0, duration - 30), duration].
     - If timing is completely unknown, begin with a uniform scan at low fps (0.25-1.0) and LOW or MEDIUM spatial token rate.
+    - If the query asks how long an opening sequence took to reach a score/state/event, prefer a broader opening window (often >= 240s) over a very short clip.
 
     **Step Configuration Guidelines (choose ONE for this step):**
     - Uniform scan of the full video when timing is unknown
@@ -323,7 +370,10 @@ class PromptManager:
         original_query: str,
         video_duration_sec: float = None,
         is_region: bool = False,
-        regions: List[Tuple[float, float]] = None
+        regions: List[Tuple[float, float]] = None,
+        media_inputs: Optional[List[Dict[str, Any]]] = None,
+        time_base: str = "",
+        temporal_hint_summary: str = "",
     ) -> str:
         """Generate prompt for video analysis step.
         
@@ -372,13 +422,56 @@ class PromptManager:
                 video_info = f"**Video Segment:** {start_sec:.1f}s to {end_sec:.1f}s (duration: {end_sec - start_sec:.1f}s)"
         
         # Build guidelines section
-        guidelines = """- All timestamps must be in seconds from the start of the ORIGINAL video (not relative to this segment)
+        guidelines = """- Canonical timestamp reference for this task is raw_video_seconds: seconds from the start of the ORIGINAL video
+- All timestamps must be in seconds from the start of the ORIGINAL video (not relative to this segment)
 - Events should be represented as time intervals (timestamp_start, timestamp_end), not single points
 - If you see the target event, note the EXACT time range where it occurs
 - If you see potential matches, list ALL relevant timestamp ranges
 - Be precise with timing - this is critical for narrowing down the search
 - Consider the context from previous rounds to avoid redundancy
 - IMPORTANT: Round intervals to full seconds: floor(timestamp_start), ceil(timestamp_end)"""
+
+        temporal_context_block = ""
+        if temporal_hint_summary:
+            temporal_context_block = f"\n**Temporal Context / Time-Base Notes:**\n- Time Base: {time_base or 'raw_video_seconds'}\n- {temporal_hint_summary}\n"
+        elif time_base:
+            temporal_context_block = f"\n**Temporal Context / Time-Base Notes:**\n- Time Base: {time_base}\n"
+
+        if time_base == "dataset_reference_only":
+            guidelines += "\n- Dataset-provided reference timings may use a different clock than the raw video; report timestamps based on the raw-video timeline visible in this observation, not by forcing alignment to annotation reference text."
+
+        clip_inputs = [
+            media_input for media_input in (media_inputs or [])
+            if media_input.get("clip_time_base") == "clip_local_seconds"
+        ]
+        media_time_mapping_block = ""
+        if clip_inputs:
+            if len(clip_inputs) == 1:
+                clip_input = clip_inputs[0]
+                clip_start = float(clip_input.get("absolute_start_sec", 0.0))
+                clip_end = float(clip_input.get("absolute_end_sec", clip_start))
+                media_time_mapping_block = f"""
+**Canonical Time Conversion for This Media Input:**
+- The provided media file is a trimmed clip covering **{clip_start:.1f}s to {clip_end:.1f}s** of the original video.
+- The clip itself starts at local clip time **0.0s**.
+- If an event appears at local clip time `t`, you MUST convert it to canonical original-video time as **{clip_start:.1f} + t** seconds.
+- Example: if something happens 5.0s after this clip begins, report it as **{clip_start + 5.0:.1f}s** in the original video.
+"""
+            else:
+                mapping_lines = []
+                for idx, clip_input in enumerate(clip_inputs, 1):
+                    clip_start = float(clip_input.get("absolute_start_sec", 0.0))
+                    clip_end = float(clip_input.get("absolute_end_sec", clip_start))
+                    mapping_lines.append(
+                        f"- Clip {idx}: local clip time `t` maps to original-video time **{clip_start:.1f} + t** seconds "
+                        f"(absolute range {clip_start:.1f}s to {clip_end:.1f}s)"
+                    )
+                media_time_mapping_block = (
+                    "\n**Canonical Time Conversion for These Media Inputs:**\n"
+                    + "\n".join(mapping_lines)
+                    + "\n- For every JSON timestamp, output the canonical original-video time after applying the correct clip-specific offset."
+                )
+            guidelines += "\n- If the provided media is a trimmed clip, never return clip-local seconds directly. Convert local clip time back to raw_video_seconds using the mapping above before writing JSON."
         
         # Add guideline for multiple clips if applicable
         if is_region and regions and len(regions) > 1:
@@ -388,6 +481,8 @@ class PromptManager:
 {query_section}
 
 {video_info}
+{temporal_context_block}
+{media_time_mapping_block}
 
 **Context from Previous Rounds:**
 {context_text}
@@ -454,6 +549,7 @@ Analyze the video now and respond with JSON only."""
             or video_meta.get("video_duration_sec")
             or "unknown"
         )
+        temporal_context_section = PromptManager._build_temporal_context_section(video_meta)
         
         # Build the full query with options if available
         full_query = query
@@ -467,6 +563,7 @@ Analyze the video now and respond with JSON only."""
 
 **Video Information:**
 - Duration: {duration} seconds
+{temporal_context_section}
 
 **Evidence Gathered from Previous Rounds:**
 {evidence_summary}
@@ -484,6 +581,7 @@ Based on the evidence gathered so far and what's still missing, plan a NEW singl
    - If previous region search failed → try uniform scan with different fps/resolution
    - If evidence is ambiguous → try higher fps or different spatial resolution
    - If specific timestamps mentioned in query → focus on those exact regions
+   - If the temporal context says the dataset timing is not authoritative for raw-video seconds, use reference timings only as weak hints and prefer broader scans
 
 **Planning Guidelines:**
 - load_mode: "uniform" (full video) or "region" (specific time spans)
@@ -517,7 +615,69 @@ The steps array MUST contain exactly ONE item.
 ```
 
 Now generate the replan for the user's query. Respond with JSON only, no additional text."""
-        
+
+        return prompt
+
+    @staticmethod
+    def get_answerability_reflection_prompt(
+        query: str,
+        video_meta: Dict[str, Any],
+        evidence_summary: str,
+        watched_intervals_text: str,
+        provisional_answer: str,
+        provisional_confidence: float,
+        round_index: int,
+        max_rounds: int,
+    ) -> str:
+        """Generate a generic reflection prompt for answerability-aware control."""
+        duration = (
+            video_meta.get("duration_sec")
+            or video_meta.get("duration")
+            or video_meta.get("video_duration_sec")
+            or "unknown"
+        )
+
+        prompt = f"""You are the reflector/controller in a general video question-answering agent framework.
+
+**User Query:** {query}
+
+**Video Information:**
+- Duration: {duration} seconds
+- Current Round: {round_index} / {max_rounds}
+
+**Watched Intervals So Far:**
+{watched_intervals_text}
+
+**Evidence Gathered So Far:**
+{evidence_summary}
+
+**Current Provisional Answer:**
+- Answer: {provisional_answer}
+- Confidence: {provisional_confidence:.2f}
+
+---
+
+**Your Task:**
+Decide whether the current evidence is actually sufficient to answer the query with high confidence, or whether the system should continue watching the video and gather more evidence.
+
+**Critical Policy:**
+- Non-empty evidence does NOT automatically mean the question can be answered.
+- If the current evidence mainly shows irrelevant context, pre-event material, missing event context, or otherwise fails to reveal the answer, set `sufficient` to false.
+- If the provisional answer says the question cannot yet be determined, keep `sufficient` false unless there is truly no reasonable search left.
+- Prefer continued search when confidence is low and unwatched or weakly covered parts of the video remain.
+- This reflection must stay generic and mechanism-level. Do NOT tailor the decision to a specific dataset, sport, or named example.
+
+**Search Strategy Guidance:**
+- `broaden`: current region was too narrow; inspect a wider temporal area
+- `shift`: move to a different temporal area
+- `uniform`: use a broader scan to relocate the event
+- `refine`: inspect a promising area more precisely
+- `stop`: enough evidence exists to answer confidently
+
+**Output Format (STRICT JSON ONLY):**
+{json.dumps(REFLECTION_SCHEMA, indent=2)}
+
+Return JSON only, no additional text."""
         return prompt
     
     @staticmethod
@@ -525,7 +685,9 @@ Now generate the replan for the user's query. Respond with JSON only, no additio
         original_query: str,
         all_evidence: str,
         video_duration: float,
-        options: Optional[List[str]] = None
+        options: Optional[List[str]] = None,
+        time_base: str = "",
+        temporal_hint_summary: str = "",
     ) -> str:
         """Generate prompt for final answer synthesis.
         
@@ -534,25 +696,52 @@ Now generate the replan for the user's query. Respond with JSON only, no additio
             all_evidence: All evidence collected from all steps
             video_duration: Total video duration
             options: Optional list of multiple choice options (e.g., ["A. Cloudy", "B. Snowy", ...])
-                      If None or empty, treated as open-ended question but still uses MCQ format
+                      If None or empty, treated as an open-ended question
         """
-        # Always use MCQ format, even for open-ended questions
-        # Normalize options to empty list if None
         options_list = options if options else []
         
         if len(options_list) > 0:
-            # MCQ with provided options
             options_text = "\n".join([f"  {opt}" for opt in options_list])
             options_section = f"""**Multiple Choice Options:**
 {options_text}"""
             task_instruction = "Based on the evidence, select the correct option and explain your reasoning."
             option_instruction = "Choose the option letter (A, B, C, D, etc.) that best answers the question"
+            output_schema = MCQ_SCHEMA
+            example_block = """**Example Response (with options):**
+```json
+{
+  "selected_option": "B",
+  "confidence": 0.95,
+  "reasoning": "The evidence shows snow falling and accumulation visible throughout the opening scene. The visual analysis confirms snowy weather conditions with white flakes clearly visible against the background.",
+  "selected_option_text": "B. Snowy"
+}
+```"""
         else:
-            # Open-ended question (no options provided) - still use MCQ format
-            options_section = "**Multiple Choice Options:**\n  No specific options provided. This is an open-ended question."
-            task_instruction = "Based on the evidence, provide a clear answer to the question. Use option 'A' as a placeholder and put your actual answer in the 'selected_option_text' and 'reasoning' fields."
-            option_instruction = "Use option 'A' as a placeholder. Put your actual answer in 'selected_option_text' and detailed explanation in 'reasoning'"
+            options_section = "**Answer Type:**\n  Open-ended question (no multiple-choice options provided)."
+            task_instruction = "Based on the evidence, provide a direct open-ended answer to the question."
+            option_instruction = "Do not invent option letters. Return a direct answer in the `answer` field."
+            output_schema = FINAL_ANSWER_SCHEMA
+            example_block = """**Example Response (open-ended):**
+```json
+{
+  "answer": "The person enters the red car at 54 seconds into the video.",
+  "key_timestamps": [52, 54],
+  "confidence": 0.9,
+  "evidence_summary": "Initial scan identified the person approaching the red car around 52s, and the later observation confirmed entry at 54s."
+}
+```"""
         
+        canonical_time_block = """**Canonical Time Reference:**  
+All evidence timestamps below are already normalized to `raw_video_seconds`, meaning seconds from the start of the original video.  
+When you return `key_timestamps`, use this same canonical timeline only."""
+        if time_base == "dataset_reference_only":
+            canonical_time_block += (
+                "\nDataset-provided annotation times may use a different clock than the raw video, "
+                "so trust the normalized evidence timestamps below instead of converting back to annotation reference text."
+            )
+        elif temporal_hint_summary:
+            canonical_time_block += f"\nTemporal note: {temporal_hint_summary}"
+
         prompt = f"""You are synthesizing the final answer to a question about a video, based on evidence from multiple observation rounds.
 
 **User's Question:** {original_query}
@@ -560,6 +749,8 @@ Now generate the replan for the user's query. Respond with JSON only, no additio
 {options_section}
 
 **Video Duration:** {video_duration:.1f} seconds
+
+{canonical_time_block}
 
 **Evidence from All Observation Rounds:**
 {all_evidence}
@@ -572,33 +763,15 @@ Now generate the replan for the user's query. Respond with JSON only, no additio
 **Guidelines:**
 1. **Select Option**: {option_instruction}
 2. **Confidence**: Provide your confidence level (0.0 to 1.0)
-3. **Reasoning**: Explain how the evidence supports your answer (include the actual answer here for open-ended questions)
-4. **Selected Option Text**: For MCQ, include the full option text. For open-ended questions, include your direct answer here.
-5. **Key Timestamps**: Mention the most important timestamps that influenced your decision in the reasoning
+3. **Supporting Evidence**: Explain how the evidence supports your answer.
+4. **Key Timestamps**: Include the most important timestamps that influenced your decision, using canonical `raw_video_seconds`.
+5. **Answer Fielding**: For open-ended questions, put the direct answer in `answer`. For MCQ, use `selected_option` and `selected_option_text`.
 
 **Output Format:**
 Respond with valid JSON:
-{json.dumps(MCQ_SCHEMA, indent=2)}
+{json.dumps(output_schema, indent=2)}
 
-**Example Response (with options):**
-```json
-{{
-  "selected_option": "B",
-  "confidence": 0.95,
-  "reasoning": "The evidence shows snow falling and accumulation visible throughout the opening scene. The visual analysis confirms snowy weather conditions with white flakes clearly visible against the background.",
-  "selected_option_text": "B. Snowy"
-}}
-```
-
-**Example Response (open-ended, no options):**
-```json
-{{
-  "selected_option": "A",
-  "confidence": 0.9,
-  "reasoning": "The person enters the red car at 54 seconds into the video. Initial scan identified a person in red jacket at 45s. Detailed analysis confirmed they approached a red car at 52s and entered it at 54s.",
-  "selected_option_text": "The person enters the red car at 54 seconds into the video."
-}}
-```
+{example_block}
 
 Provide your final answer now in JSON format only."""
     
@@ -893,21 +1066,57 @@ def parse_json_response(response_text: str) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         pass
     
+    def extract_balanced_json_candidates(text: str) -> List[str]:
+        candidates: List[str] = []
+        for start in range(len(text)):
+            if text[start] != "{":
+                continue
+            depth = 0
+            in_string = False
+            escape = False
+            for end in range(start, len(text)):
+                ch = text[end]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(text[start:end + 1])
+                        break
+        return candidates
+
     # Try to extract JSON from markdown code blocks
     patterns = [
         r'```json\s*\n(.*?)\n```',  # ```json ... ```
         r'```\s*\n(.*?)\n```',       # ``` ... ```
-        r'\{.*\}',                    # Raw JSON object
     ]
     
     for pattern in patterns:
         match = re.search(pattern, response_text, re.DOTALL)
         if match:
             try:
-                json_str = match.group(1) if '```' in pattern else match.group(0)
+                json_str = match.group(1)
                 return json.loads(json_str)
             except json.JSONDecodeError:
                 continue
+
+    # Try all balanced JSON objects and prefer the largest valid one.
+    candidates = sorted(extract_balanced_json_candidates(response_text), key=len, reverse=True)
+    for json_str in candidates:
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            continue
     
     return None
 
@@ -927,4 +1136,3 @@ def validate_against_schema(data: Dict[str, Any], schema: Dict[str, Any]) -> boo
             if field not in data:
                 return False
     return True
-

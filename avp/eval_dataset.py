@@ -15,7 +15,7 @@ import argparse
 import time
 import signal
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 import re
 
 # Handle imports when run as script or module
@@ -62,6 +62,8 @@ def extract_answer(final_answer_data: str | Dict[str, Any], options: list[str]) 
     """
     # Handle dict format (from synthesize_final_answer)
     if isinstance(final_answer_data, dict):
+        if "answer" in final_answer_data:
+            return str(final_answer_data["answer"]).strip()
         # MCQ format
         if "selected_option" in final_answer_data:
             selected = final_answer_data["selected_option"].strip().upper()
@@ -72,12 +74,10 @@ def extract_answer(final_answer_data: str | Dict[str, Any], options: list[str]) 
             if len(selected) >= 1 and selected[0].isalpha():
                 return selected[0]
             return selected
-        # Open-ended format
-        elif "answer" in final_answer_data:
-            return final_answer_data["answer"]
-        else:
-            # Fallback: return first field as string
-            return str(list(final_answer_data.values())[0]) if final_answer_data else ""
+        if "selected_option_text" in final_answer_data and not options:
+            return str(final_answer_data["selected_option_text"]).strip()
+        # Fallback: return first field as string
+        return str(list(final_answer_data.values())[0]) if final_answer_data else ""
     
     # Handle string format (legacy)
     final_answer_upper = str(final_answer_data).upper().strip()
@@ -90,6 +90,90 @@ def extract_answer(final_answer_data: str | Dict[str, Any], options: list[str]) 
     
     # Fallback: return raw answer
     return str(final_answer_data).strip()
+
+
+_CLOCK_REF_RE = re.compile(r'(?<!\d)(\d{1,2}):(\d{2})(?!\d)')
+
+
+def extract_clock_seconds(text: str) -> List[int]:
+    """Extract mm:ss references from free text as seconds, preserving order."""
+    if not text:
+        return []
+    values = []
+    seen = set()
+    for mins, secs in _CLOCK_REF_RE.findall(str(text)):
+        total = int(mins) * 60 + int(secs)
+        if total not in seen:
+            values.append(total)
+            seen.add(total)
+    return values
+
+
+def build_sample_time_metadata(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive runtime timing metadata from a dataset sample."""
+    time_reference = str(sample.get("time_reference", "") or "").strip()
+    cot_reference = str(sample.get("cot_reference", sample.get("CoT", "")) or "").strip()
+    explicit_time_base = str(sample.get("time_base", "") or "").strip()
+
+    time_reference_sec = extract_clock_seconds(time_reference)
+    cot_reference_sec = extract_clock_seconds(cot_reference)
+
+    reference_source = ""
+    reference_times_sec: List[int] = []
+    if time_reference_sec:
+        reference_source = "time_reference"
+        reference_times_sec = time_reference_sec
+    elif cot_reference_sec:
+        reference_source = "cot_reference"
+        reference_times_sec = cot_reference_sec
+
+    if explicit_time_base:
+        time_base = explicit_time_base
+    elif time_reference_sec:
+        time_base = "raw_video_seconds"
+    elif cot_reference_sec:
+        time_base = "dataset_reference_only"
+    else:
+        time_base = "raw_video_seconds"
+
+    reference_time_range_sec: List[int] = []
+    reference_duration_sec: Optional[int] = None
+    if reference_times_sec:
+        reference_time_range_sec = [reference_times_sec[0], reference_times_sec[-1]]
+        if reference_time_range_sec[1] > reference_time_range_sec[0]:
+            reference_duration_sec = reference_time_range_sec[1] - reference_time_range_sec[0]
+
+    if time_base == "raw_video_seconds" and time_reference:
+        temporal_hint_summary = (
+            f"Trusted annotation time reference: {time_reference}. "
+            "Treat these times as absolute seconds from the original raw video."
+        )
+    elif time_base == "dataset_reference_only" and reference_times_sec:
+        times_text = ", ".join(
+            f"{sec // 60:02d}:{sec % 60:02d}" for sec in reference_times_sec
+        )
+        duration_text = (
+            f" The referenced event sequence spans about {reference_duration_sec} seconds in dataset-local timing."
+            if reference_duration_sec is not None
+            else ""
+        )
+        temporal_hint_summary = (
+            f"Dataset-provided reference timings from {reference_source}: {times_text}."
+            f"{duration_text} These timings may not match absolute raw-video seconds, so use them only as weak hints"
+            " for event order and rough duration, not as exact localization coordinates."
+        )
+    else:
+        temporal_hint_summary = ""
+
+    return {
+        "time_base": time_base,
+        "time_reference": time_reference,
+        "reference_time_source": reference_source,
+        "reference_times_sec": reference_times_sec,
+        "reference_time_range_sec": reference_time_range_sec,
+        "reference_duration_sec": reference_duration_sec,
+        "temporal_hint_summary": temporal_hint_summary,
+    }
 
 
 def evaluate_dataset(
@@ -152,6 +236,7 @@ def evaluate_dataset(
             print(f"No answer found in solution: {solution}")
             answer = sample.get("answer", sample.get("answer", ""))
         options = sample.get("options", [])
+        sample_time_metadata = build_sample_time_metadata(sample)
         
         print(f"\n[{idx+1}/{len(samples)}] Video: {video_id}")
         print(f"Question: {question[:100]}...")
@@ -199,9 +284,12 @@ def evaluate_dataset(
                     project=cfg.project,
                     location=sample_location,
                     api_key=api_key_val,
+                    base_url=(cfg.base_url or "").strip() or None,
                     max_frame_low=cfg.max_frame_low,
                     max_frame_medium=cfg.max_frame_medium,
                     max_frame_high=cfg.max_frame_high,
+                    prefer_compressed=cfg.prefer_compressed,
+                    keep_temp_clips=cfg.keep_temp_clips,
                     debug=cfg.debug,
                 )
                 client.initialize_client()
@@ -218,8 +306,8 @@ def evaluate_dataset(
                     "options": options,
                     "answer": answer,
                     "duration": sample.get("duration"),
-                    "time_reference": sample.get("time_reference", ""),
                     "task_type": sample.get("task_type", ""),
+                    **sample_time_metadata,
                     "full_sample": sample  # Store entire sample for debugging
                 }
                 with open(Path(sample_dir) / "sample_metadata.json", "w") as f:
@@ -230,6 +318,7 @@ def evaluate_dataset(
                     video_path=video_path,
                     client=client,
                     options=options,
+                    sample_metadata=sample_time_metadata,
                 )
                 
                 # Format query with options for MCQ
@@ -300,7 +389,10 @@ def evaluate_dataset(
             print(f"Running Accuracy: {correct}/{total} = {100*correct/total:.1f}%")
 
             # Clean up video clips after sample evaluation (only clips created during this sample)
-            cleanup_video_clips(clip_paths=controller.client.created_clips, debug=True)
+            if controller.client.keep_temp_clips:
+                print("ℹ️  keep_temp_clips=True, preserving generated clips for debugging")
+            else:
+                cleanup_video_clips(clip_paths=controller.client.created_clips, debug=True)
             
         except TimeoutError as e:
             print(f"TIMEOUT on sample {idx}: {e}")
@@ -325,7 +417,8 @@ def evaluate_dataset(
                     clip_paths = getattr(controller.client, 'created_clips', [])
             except:
                 pass
-            cleanup_video_clips(clip_paths=clip_paths, debug=True)
+            if not getattr(controller.client, "keep_temp_clips", False):
+                cleanup_video_clips(clip_paths=clip_paths, debug=True)
             
         except Exception as e:
             print(f"ERROR on sample {idx}: {e}")
@@ -345,12 +438,15 @@ def evaluate_dataset(
             # Clean up video clips after sample evaluation (even on error)
             # Try to get clips from controller if available
             clip_paths = []
+            keep_temp_clips = False
             try:
                 if 'controller' in locals() and hasattr(controller, 'client'):
                     clip_paths = getattr(controller.client, 'created_clips', [])
-            except:
+                    keep_temp_clips = getattr(controller.client, 'keep_temp_clips', False)
+            except Exception:
                 pass
-            cleanup_video_clips(clip_paths=clip_paths, debug=True)
+            if not keep_temp_clips:
+                cleanup_video_clips(clip_paths=clip_paths, debug=True)
     
     # Summary
     accuracy = correct / total if total > 0 else 0.0
@@ -394,4 +490,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
