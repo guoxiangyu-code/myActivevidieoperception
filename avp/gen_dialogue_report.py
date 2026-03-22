@@ -18,7 +18,7 @@ import argparse
 import json
 import pathlib
 import textwrap
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -81,13 +81,68 @@ def _role_icon(role: str) -> str:
     }.get(role, f"❓  **{role}**")
 
 
+def _fmt_seconds_list(values: List[Any]) -> str:
+    secs: List[float] = []
+    for value in values or []:
+        if isinstance(value, (int, float)):
+            secs.append(float(value))
+    if not secs:
+        return "—"
+    return ", ".join(f"`{_fmt_seconds(sec)}`" for sec in secs)
+
+
+def _load_evidence_payloads(run_dir: pathlib.Path) -> List[Dict[str, Any]]:
+    ev_dir = run_dir / "evidence"
+    payloads: List[Dict[str, Any]] = []
+    if not ev_dir.exists():
+        return payloads
+    for ev_file in sorted(ev_dir.glob("round_*/evidence.json")):
+        ev = _load_json(ev_file)
+        if ev:
+            payloads.append(ev)
+    return payloads
+
+
+def _fmt_interval(start: Any, end: Any) -> str:
+    if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+        return f"`{_fmt_seconds(float(start))}` – `{_fmt_seconds(float(end))}`"
+    if isinstance(start, (int, float)):
+        return f"`{_fmt_seconds(float(start))}`"
+    return "—"
+
+
+def _extract_time_contract(
+    meta: Optional[Dict[str, Any]],
+    sample_meta: Optional[Dict[str, Any]],
+    evidence_payloads: List[Dict[str, Any]],
+) -> Tuple[str, str]:
+    annotation_time_base = str(
+        (sample_meta or {}).get("time_base")
+        or (meta or {}).get("time_base")
+        or "raw_video_seconds"
+    )
+    canonical_time_base = "raw_video_seconds"
+    for ev in evidence_payloads:
+        normalization = (((ev or {}).get("model_call") or {}).get("time_normalization") or {})
+        candidate = normalization.get("canonical_reference")
+        if candidate:
+            canonical_time_base = str(candidate)
+            break
+    return annotation_time_base, canonical_time_base
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Section builders
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _section_overview(meta: Optional[Dict], sample_meta: Optional[Dict],
-                      final: Optional[Dict]) -> str:
+def _section_overview(
+    meta: Optional[Dict],
+    sample_meta: Optional[Dict],
+    final: Optional[Dict],
+    evidence_payloads: List[Dict[str, Any]],
+) -> str:
     lines = ["## 概览 Overview\n"]
+    annotation_time_base, canonical_time_base = _extract_time_contract(meta, sample_meta, evidence_payloads)
 
     if sample_meta:
         lines.append(f"- **视频 ID**: `{sample_meta.get('video_id', 'N/A')}`")
@@ -97,8 +152,21 @@ def _section_overview(meta: Optional[Dict], sample_meta: Optional[Dict],
         dur = sample_meta.get("duration")
         if dur:
             lines.append(f"- **视频时长**: {_fmt_seconds(float(dur))} ({dur}s)")
+        lines.append(f"- **标注/提示时间基准**: `{annotation_time_base}`")
+        if sample_meta.get("reference_time_source"):
+            lines.append(
+                f"- **数据集提示时间** ({sample_meta.get('reference_time_source')}): "
+                f"{_fmt_seconds_list(sample_meta.get('reference_times_sec', []))}"
+            )
     elif meta:
         lines.append(f"- **视频**: `{meta.get('video_path', 'N/A')}`")
+
+    lines.append(f"- **报告中的模型时间基准**: `{canonical_time_base}`")
+    if annotation_time_base == "dataset_reference_only":
+        lines.append(
+            "- **注意**: 数据集里的时间提示与模型证据时间不是同一坐标系；"
+            "下文的 Planner / Evidence / Final Answer 时间统一按原视频绝对秒（`raw_video_seconds`）呈现。"
+        )
 
     if final:
         lines.append(f"\n**模型最终答案**: {final.get('answer', 'N/A')}")
@@ -112,6 +180,69 @@ def _section_overview(meta: Optional[Dict], sample_meta: Optional[Dict],
     return "\n".join(lines) + "\n"
 
 
+def _section_timebase_contract(
+    meta: Optional[Dict[str, Any]],
+    sample_meta: Optional[Dict[str, Any]],
+    evidence_payloads: List[Dict[str, Any]],
+) -> str:
+    annotation_time_base, canonical_time_base = _extract_time_contract(meta, sample_meta, evidence_payloads)
+
+    lines = ["## 时间基准说明 Time-base Contract\n"]
+    lines.append(f"- **标注/提示时间基准**: `{annotation_time_base}`")
+    lines.append(f"- **报告中的模型时间基准**: `{canonical_time_base}`")
+    lines.append(
+        "- **统一约定**: 下文出现的观测区间、证据时间、最终 `key_timestamps`，"
+        "都按 `raw_video_seconds` 解释，即“从原始视频开头开始计秒”。"
+    )
+
+    if sample_meta:
+        ref_source = sample_meta.get("reference_time_source")
+        ref_times = sample_meta.get("reference_times_sec", [])
+        hint_summary = sample_meta.get("temporal_hint_summary", "")
+        if ref_source and ref_times:
+            lines.append(f"- **数据集提示时间** ({ref_source}): {_fmt_seconds_list(ref_times)}")
+        if hint_summary:
+            lines.append(f"- **时间提示说明**: {hint_summary}")
+
+    if not evidence_payloads:
+        return "\n".join(lines) + "\n"
+
+    lines.append("\n### 媒体输入与时间映射\n")
+    lines.append("| 轮次 | 媒体输入 | 原视频绝对范围 | 媒体本地时间基准 | 报告输出时间基准 | 归一化状态 |")
+    lines.append("|------|----------|----------------|------------------|------------------|------------|")
+
+    for ev in evidence_payloads:
+        round_id = ev.get("round_id", "?")
+        model_call = ev.get("model_call", {}) or {}
+        normalization = model_call.get("time_normalization", {}) or {}
+        canonical_ref = normalization.get("canonical_reference", "raw_video_seconds")
+        media_inputs = model_call.get("media_inputs", []) or [{}]
+
+        for media_input in media_inputs:
+            input_type = media_input.get("input_type", "unknown")
+            abs_interval = _fmt_interval(
+                media_input.get("absolute_start_sec"),
+                media_input.get("absolute_end_sec"),
+            )
+            clip_time_base = media_input.get("clip_time_base", "unknown")
+
+            if clip_time_base == "clip_local_seconds":
+                if normalization.get("applied"):
+                    shift_sec = normalization.get("shift_sec", normalization.get("source_clip_start_sec", 0.0))
+                    norm_status = f"后处理换算回原视频秒（+{shift_sec:.1f}s）"
+                else:
+                    norm_status = "模型已直接返回原视频秒，无需后处理"
+            else:
+                norm_status = "原样就是原视频秒"
+
+            lines.append(
+                f"| R{round_id} | `{input_type}` | {abs_interval} | `{clip_time_base}` | "
+                f"`{canonical_ref}` | {norm_status} |"
+            )
+
+    return "\n".join(lines) + "\n"
+
+
 def _section_initial_plan(plan: Optional[Dict]) -> str:
     if not plan:
         return ""
@@ -120,7 +251,7 @@ def _section_initial_plan(plan: Optional[Dict]) -> str:
     regions = plan.get("watch", {}).get("regions", [])
     if regions:
         reg_str = ", ".join(f"[{_fmt_seconds(s)}–{_fmt_seconds(e)}]" for s, e in regions)
-        lines.append(f"- **观测区间**: {reg_str}")
+        lines.append(f"- **观测区间** (`raw_video_seconds`): {reg_str}")
     fps = plan.get("watch", {}).get("fps")
     if fps:
         lines.append(f"- **帧率 FPS**: {fps}")
@@ -185,21 +316,24 @@ def _section_dialogues(traces: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def _section_evidence_timeline(traces: List[Dict], run_dir: pathlib.Path) -> str:
+def _section_evidence_timeline(
+    traces: List[Dict],
+    run_dir: pathlib.Path,
+    evidence_payloads: List[Dict[str, Any]],
+) -> str:
     lines = ["## 视频证据时间线 Evidence Timeline\n"]
+    lines.append("> 下表时间统一为 `raw_video_seconds`（从原始视频开头开始计秒）。\n")
 
     # Collect evidence from all rounds
-    ev_dir = run_dir / "evidence"
     all_items: List[Dict] = []
-    if ev_dir.exists():
-        for ev_file in sorted(ev_dir.glob("*.json")):
-            ev = _load_json(ev_file)
-            if ev:
-                round_id = ev.get("round_id", "?")
-                for item in ev.get("key_evidence", []):
-                    if isinstance(item, dict):
-                        item["_round"] = round_id
-                        all_items.append(item)
+    if evidence_payloads:
+        for ev in evidence_payloads:
+            round_id = ev.get("round_id", "?")
+            for item in ev.get("key_evidence", []):
+                if isinstance(item, dict):
+                    cloned = dict(item)
+                    cloned["_round"] = round_id
+                    all_items.append(cloned)
 
     if not all_items:
         # Fallback: parse from observer traces
@@ -247,7 +381,7 @@ def _section_final_answer(final: Optional[Dict]) -> str:
     kts = final.get("key_timestamps", [])
     if kts:
         ts_str = ", ".join(f"`{_fmt_seconds(t)}`" for t in kts)
-        lines.append(f"**关键时间点**: {ts_str}\n")
+        lines.append(f"**关键时间点** (`raw_video_seconds`): {ts_str}\n")
     conf = final.get("confidence")
     if conf is not None:
         lines.append(f"**置信度**: {conf:.2f}\n")
@@ -264,13 +398,15 @@ def generate_report(run_dir: pathlib.Path, out_path: pathlib.Path) -> None:
     final         = _load_json(run_dir / "final_answer.json")
     meta          = _load_json(run_dir / "meta.json")
     sample_meta   = _load_json(run_dir / "sample_metadata.json")
+    evidence_payloads = _load_evidence_payloads(run_dir)
 
     sections = [
         f"# AVP 对话报告 — {run_dir.name}\n",
-        _section_overview(meta, sample_meta, final),
+        _section_overview(meta, sample_meta, final, evidence_payloads),
+        _section_timebase_contract(meta, sample_meta, evidence_payloads),
         _section_initial_plan(plan),
         _section_dialogues(traces),
-        _section_evidence_timeline(traces, run_dir),
+        _section_evidence_timeline(traces, run_dir, evidence_payloads),
         _section_final_answer(final),
     ]
 
