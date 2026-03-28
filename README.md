@@ -1,5 +1,5 @@
-# ActiveVideoPerception Demo
-## 基于 Gemini-2.5-Pro 的长视频篮球问答演示
+# AthenaQA（from ActiveVideoPerception）
+## 基于 Gemini-2.5-Pro 的长视频问答框架（多个agent代理）
 
 <div align="center">
 
