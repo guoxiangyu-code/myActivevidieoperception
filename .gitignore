@@ -1,0 +1,30 @@
+# Credentials & API keys
+api_key_config.txt
+modelscopeapi.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Evaluation outputs (regenerable)
+avp/out/*/
+!avp/out/.gitkeep
+
+# Dataset videos (too large for git)
+dataset/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Temporary files
+/tmp/
+*.tmp
