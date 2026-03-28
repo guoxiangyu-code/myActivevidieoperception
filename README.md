@@ -54,7 +54,6 @@
   </tr>
   <tr>
     <td align="center"><strong>运行目录</strong><br><code>avp/out/q1_to_q5_rerun_unified_20260321_180320</code></td>
-    <td align="center"><strong>自动 exact-match</strong><br><code>1 / 5</code></td>
     <td align="center"><strong>人工语义复核</strong><br><code>4 / 5</code></td>
   </tr>
   <tr>
