@@ -42,15 +42,6 @@
 - 运行日志与中间产物
 
 都完整保存在仓库里，方便直接打开查看。
-
-> **我们对这 5 道题目的最终 Demo 判断：**
->
-> - `Q1`：正确
-> - `Q2`：正确
-> - `Q3`：正确
-> - `Q4`：未通过
-> - `Q5`：正确
-
 ---
 
 ## 📌 Demo 关键信息面板
@@ -99,11 +90,11 @@
 
 | Q | 类型 | Planner 最终策略 | 关键证据时间 | 模型结论摘要 | 自动评测 | 人工复核 | Demo |
 |---|------|------------------|--------------|--------------|----------|----------|------|
-| **Q1** | 因果推理 | `region [[93, 128]]` | `120-123s`, `127-130s` | 已抓住“库里在防守掩护时被挡住”的核心因果链 | ❌ | ✅ | [`sample_0`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_0/) |
-| **Q2** | 感知计数 | `uniform full-video` | `155-158s`, `184-187s` | 正确数出雷霆前 8 分过程中的两次三分出手 | ✅ | ✅ | [`sample_1`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_1/) |
-| **Q3** | 战术推理 | `region [[245, 275]]` | `270-274s` | 已明确回答“个人运球创造投篮空间”这一主因 | ❌ | ✅ | [`sample_2`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_2/) |
-| **Q4** | 反事实推理 | `uniform full-video` | `1810-1813s`, `1824-1829s` | 系统搜到最接近真实回合，但题干与原视频不完全匹配 | ❌ | ❌ | [`sample_3`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_3/) |
-| **Q5** | 时序推理 | `region [[0, 240]]` | `103-187s` | 给出 `83 秒`，与证据链和参考区间一致 | ❌ | ✅ | [`sample_4`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_4/) |
+| **Q1** | 因果推理 | `region [[93, 128]]` | `120-123s`, `127-130s` | 已抓住“库里在防守掩护时被挡住”的核心因果链  | ✅ | [`sample_0`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_0/) |
+| **Q2** | 感知计数 | `uniform full-video` | `155-158s`, `184-187s` | 正确数出雷霆前 8 分过程中的两次三分出手 | ✅ | [`sample_1`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_1/) |
+| **Q3** | 战术推理 | `region [[245, 275]]` | `270-274s` | 已明确回答“个人运球创造投篮空间”这一主因 | ✅ | [`sample_2`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_2/) |
+| **Q4** | 反事实推理 | `uniform full-video` | `1810-1813s`, `1824-1829s` | 系统搜到最接近真实回合，但题干与原视频不完全匹配  | ❌ | [`sample_3`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_3/) |
+| **Q5** | 时序推理 | `region [[0, 240]]` | `103-187s` | 给出 `83 秒`，与证据链和参考区间一致 | ✅ | [`sample_4`](avp/out/q1_to_q5_rerun_unified_20260321_180320/all_sample/sample_4/) |
 
 ---
 
