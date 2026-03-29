@@ -1,9 +1,12 @@
 """QwenClient – OpenAI-compatible adapter that mirrors GeminiClient's interface.
 
-Uses the OpenAI Python SDK to call Qwen2.5-VL-72B-Instruct (or any
-OpenAI-compatible endpoint) while exposing the same public surface as
+Uses the OpenAI Python SDK to call Qwen3-Omni (DashScope) or any
+OpenAI-compatible endpoint while exposing the same public surface as
 ``GeminiClient`` so that ``Controller``, ``Observer``, ``Reflector``, and
 ``eval_dataset`` can swap backends transparently.
+
+Supports native video input via base64 data URLs (with audio preserved),
+leveraging Qwen3-Omni's native video+audio understanding capability.
 """
 from __future__ import annotations
 
@@ -86,6 +89,7 @@ class _OpenAICompatProxy:
         resp = self._client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": text_content}],
+            modalities=["text"],
         )
         return _CompatResponse(resp.choices[0].message.content)
 
@@ -105,7 +109,7 @@ class QwenClient:
 
     def __init__(
         self,
-        model: str = "qwen2.5-vl-72b-instruct",
+        model: str = "qwen3-omni-flash",
         plan_replan_model: Optional[str] = None,
         execute_model: Optional[str] = None,
         project: str = "",
@@ -113,7 +117,7 @@ class QwenClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         debug: bool = False,
-        max_frame_low: int = 512,
+        max_frame_low: int = 240,
         max_frame_medium: int = 128,
         max_frame_high: int = 128,
         prefer_compressed: bool = True,
@@ -181,19 +185,54 @@ class QwenClient:
         resp = self._openai_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
+            modalities=["text"],
         )
         return resp.choices[0].message.content
 
     def _call_video_api(self, model: str, prompt: str, video_content_blocks: List[Dict[str, Any]]) -> str:
-        """Multi-modal call with video / image content blocks."""
+        """Multi-modal call with video / image content blocks.
+
+        Automatically dispatches to dashscope SDK for local file paths
+        (large videos) or openai SDK for base64 content (small clips).
+        """
         if self._openai_client is None:
             self.initialize_client()
+
+        # Check for local file path markers (large videos that exceed base64 limit)
+        local_files = [b["path"] for b in video_content_blocks if b.get("type") == "_local_video"]
+        if local_files:
+            return self._call_video_api_dashscope(model, prompt, local_files)
+
+        # Standard openai SDK path for base64 inline content
         content = video_content_blocks + [{"type": "text", "text": prompt}]
         resp = self._openai_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": content}],
+            modalities=["text"],
         )
         return resp.choices[0].message.content
+
+    def _call_video_api_dashscope(self, model: str, prompt: str, video_paths: List[str]) -> str:
+        """Call DashScope API with local video files (auto-uploaded to OSS)."""
+        import dashscope
+        from dashscope import MultiModalConversation
+
+        dashscope.api_key = self.api_key
+        content = [{'video': p} for p in video_paths]
+        content.append({'text': prompt})
+        messages = [{'role': 'user', 'content': content}]
+
+        response = MultiModalConversation.call(
+            model=model,
+            messages=messages,
+            modalities=['text'],
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"DashScope API error {response.status_code}: "
+                f"{getattr(response, 'message', response)}"
+            )
+        return response.output.choices[0].message.content[0]['text']
 
     # ------------------------------------------------------------------
     # Video helpers
@@ -330,8 +369,24 @@ class QwenClient:
         if self.debug:
             print(f"📹 Video metadata: fps={fps}, startOffset={start_offset}, endOffset={end_offset}, mode={self.qwen_video_mode}")
 
+        # --- Determine effective video duration for hybrid mode decision ---
+        effective_duration = duration_sec or 0
+        if (effective_duration <= 0) and start_sec is not None and end_sec is not None:
+            effective_duration = max(0, end_sec - start_sec)
+
         # --- Build content blocks based on qwen_video_mode ---
+        # Hybrid logic: for long videos (>10min), use frames for overview scans,
+        # native video for shorter targeted clips (where audio matters).
+        _LONG_VIDEO_THRESHOLD = 600  # 10 minutes
+        use_frames = False
         if self.qwen_video_mode == "frames":
+            use_frames = True
+        elif self.qwen_video_mode == "video" and effective_duration > _LONG_VIDEO_THRESHOLD:
+            if self.debug:
+                print(f"⚠️  Video segment {effective_duration:.0f}s > {_LONG_VIDEO_THRESHOLD}s, using frames for overview scan")
+            use_frames = True
+
+        if use_frames:
             return self._build_frames_blocks(actual_video_path, fps, start_sec, end_sec, media_resolution)
         elif self.qwen_video_mode == "auto":
             try:
@@ -341,11 +396,20 @@ class QwenClient:
                     print("⚠️  video mode failed, falling back to frames")
                 return self._build_frames_blocks(actual_video_path, fps, start_sec, end_sec, media_resolution)
         else:
-            # default: "video"
+            # default: "video" for short clips
             return self._build_video_block(actual_video_path)
 
+    # Maximum file size for base64 inline encoding (~14MB → ~19MB base64, under DashScope 20MB limit)
+    _MAX_INLINE_BYTES = 14 * 1024 * 1024
+
     def _build_video_block(self, video_path: str) -> List[Dict[str, Any]]:
-        """Read entire video file → base64 → single ``video_url`` block."""
+        """Build video content block. Uses base64 inline for small files,
+        local file path marker for large files (dispatched to dashscope SDK)."""
+        file_size = os.path.getsize(video_path)
+        if file_size > self._MAX_INLINE_BYTES:
+            if self.debug:
+                print(f"📦 Video {file_size/1024/1024:.1f}MB > 14MB limit, using dashscope file upload")
+            return [{"type": "_local_video", "path": os.path.abspath(video_path)}]
         mime = get_mime_type(video_path)
         with open(video_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
@@ -748,7 +812,7 @@ class QwenClient:
             if use_reencoded_uniform_clip:
                 clip_dir = self.temp_clips_dir if self.temp_clips_dir else os.path.join(os.path.dirname(video_path), "temp_clips")
                 if media_res == "low":
-                    scale_width, video_bitrate, audio_bitrate, frame_rate, crf = 480, "220k", None, 6.0, 32
+                    scale_width, video_bitrate, audio_bitrate, frame_rate, crf = 480, "220k", "24k", 6.0, 32
                 elif media_res == "medium":
                     scale_width, video_bitrate, audio_bitrate, frame_rate, crf = 640, "320k", "32k", 8.0, 30
                 else:

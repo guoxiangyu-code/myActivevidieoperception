@@ -1,6 +1,63 @@
-# Progress Log: 方案B — QwenClient 适配层
+# Progress Log: 方案A — Qwen3-Omni 迁移
 
-## Session: 2026-03-29
+> 前阶段 (方案B: Qwen2.5-VL) 已完成，tag qwen2.5 已推送。本日志记录 Qwen3-Omni 迁移进度。
+
+---
+
+## Session: 2026-03-29 — Qwen3-Omni DashScope 实施
+
+### Phase 0: API 连通性验证 ✅
+- ModelScope API: ❌ Qwen3-Omni 不在 ModelScope 模型列表，两个 token 均 401
+- DashScope API: ✅ 文本/视频均可用，支持 base64 data URL 和 dashscope SDK 上传
+- 可用模型: `qwen3-omni-flash`, `qwen-omni-turbo`
+- 非流式也能用（与文档说法不同）
+- `modalities=["text"]` 必需
+
+### Phase 1-3: 代码改造 ✅
+- `avp/config.py`: 默认模型→qwen3-omni-flash, base_url→DashScope, DASHSCOPE_API_KEY 优先
+- `avp/qwen_client.py`:
+  - 添加 `modalities=["text"]` 到所有 API 调用
+  - 双路径视频处理: base64 (<14MB) / dashscope SDK (>14MB)
+  - **混合模式**: 长视频 (>600s) 自动降级为帧模式，短片段用原生视频
+  - 帧数上限 240 (DashScope 限制 250 data-uri)
+  - 低分辨率音频保留 (None→"24k")
+- `avp/config.qwen.example.json`: Qwen3-Omni 配置模板
+- `api_key_config.txt`: 添加 DASHSCOPE_API_KEY
+- `requirements.txt`: 添加 dashscope>=1.20.0
+
+### Phase 4: Basketball 测试结果
+
+#### 失败历史
+| # | 方式 | 错误 |
+|---|------|------|
+| 1 | base64 内联 (53MB→71MB) | 超过 DashScope 20MB 字符串限制 |
+| 2 | dashscope SDK 上传 | "The audio is too long" (30分钟视频) |
+| 3 | 帧模式 512帧 | 超过 DashScope 250 data-uri 限制 |
+
+#### 成功运行 (混合模式)
+- 30分钟视频 → 自动使用帧模式 (240帧, 每帧~7.7s)
+- 管道完整运行: Planner → Observer (1轮) → Verifier → Synthesizer
+- 耗时: 98.4s
+- **答案错误**: 预测 "0" 三分出手，正确答案 "2次"
+- 原因: 帧间隔太大 (7.7s/帧)，无法追踪单次投篮动作
+
+#### 三模型对比
+| 模型 | 输入方式 | 答案 | 正确 | 耗时 | 轮次 |
+|------|---------|------|------|------|------|
+| Gemini 2.5 Pro | 原生视频+音频 | 2次 | ✅ | 164s | 2 |
+| Qwen2.5-VL-72B (帧模式) | 32 JPEGs | 3次 | ❌ | 290s | 3 |
+| **Qwen3-Omni-Flash (混合)** | **240帧 (降级)** | **0** | **❌** | **98.4s** | **1** |
+
+### 关键发现
+1. Qwen3-Omni 的音频时长限制使得 30 分钟视频无法原生处理
+2. 混合模式工程上可行，但长视频的 Round 1 概览仍依赖帧模式
+3. 对于 <10 分钟的目标片段 (Round 2+)，可以使用原生视频+音频
+4. 本次测试 Verifier 在 Round 1 后就判定 sufficient (confidence=0.80)，未触发 Round 2 原生视频分析
+5. 非流式调用实际可用，简化了实现
+
+---
+
+## 历史记录 (方案B: Qwen2.5-VL)
 
 ### Phase 1: 需求分析与接口规格确认
 - **Status:** ✅ complete (含深度 GAP 分析)
