@@ -1,3 +1,5 @@
+> ⚠️ **qwen2.5 分支说明**: 本版本尝试使用 Qwen2.5-VL-72B-Instruct 替代 Gemini 2.5 Pro，但由于 frames 采样模式下帧间信息丢失严重（无法区分上篮与三分球等动作细节），且 yunwu.ai 代理不支持 video_url 原生视频上传，**改造未成功，目前采样无法满足需要**。详见 `qwen_basketball_test_report.md` 和 `gemini_basketball_test_report.md` 的对比测试报告。
+
 # ActiveVideoPerception Demo
 ## 基于 Gemini-2.5-Pro 的长视频篮球问答演示
 

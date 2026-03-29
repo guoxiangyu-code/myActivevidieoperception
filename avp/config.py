@@ -51,6 +51,15 @@ class AVPConfig:
     max_frame_medium: int = 128
     max_frame_high: int = 128
 
+    # --- Qwen backend fields ---
+    backend: str = "gemini"  # "gemini" | "qwen"
+    qwen_api_key: str = ""
+    qwen_base_url: str = ""  # defaults to GEMINI_BASE_URL if empty
+    qwen_model: str = "qwen2.5-vl-72b-instruct"
+    qwen_plan_model: str = ""  # empty → fallback to qwen_model
+    qwen_execute_model: str = ""  # empty → fallback to qwen_model
+    qwen_video_mode: str = "video"  # "video" | "frames" | "auto"
+
     def __post_init__(self):
         """Initialize location as list if it's a string."""
         if isinstance(self.location, str):
@@ -75,6 +84,18 @@ class AVPConfig:
         if self.execute_model:
             return self.execute_model
         return self.model
+
+    def get_qwen_plan_model(self) -> str:
+        """Get the Qwen model for planning/replanning."""
+        return self.qwen_plan_model or self.qwen_model
+
+    def get_qwen_execute_model(self) -> str:
+        """Get the Qwen model for execution/inference."""
+        return self.qwen_execute_model or self.qwen_model
+
+    def get_qwen_base_url(self) -> str:
+        """Get the Qwen base URL, falling back to Gemini base_url."""
+        return (self.qwen_base_url or "").strip() or (self.base_url or "").strip() or os.getenv("GEMINI_BASE_URL", "")
     
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "AVPConfig":
@@ -99,6 +120,10 @@ class AVPConfig:
         # API key: env overrides config so production can use env-only
         cfg.api_key = os.getenv("GEMINI_API_KEY", cfg.api_key or "")
         cfg.base_url = os.getenv("GEMINI_BASE_URL", cfg.base_url or "")
+        # Qwen env overrides
+        cfg.backend = os.getenv("AVP_BACKEND", cfg.backend or "gemini")
+        cfg.qwen_api_key = os.getenv("QWEN_API_KEY", cfg.qwen_api_key or "")
+        cfg.qwen_base_url = os.getenv("QWEN_BASE_URL", cfg.qwen_base_url or "")
         # Ensure location is properly initialized as a list
         cfg.__post_init__()
         return cfg
