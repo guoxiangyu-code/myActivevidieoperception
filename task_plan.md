@@ -1,198 +1,250 @@
-# Task Plan: 方案B — QwenClient 适配层实现（API 模式）
+# Task Plan: 方案A — Qwen3-Omni 迁移（DashScope 原生视频+音频）
+
+## Background
+
+方案B (Qwen2.5-VL frames模式) 已实现并测试，但因帧采样丢失了关键时序信息（误判上篮为三分球），
+效果不及 Gemini 原生视频。本方案迁移到 **Qwen3-Omni**，利用 DashScope 官方 API 的原生视频+音频
+理解能力，尽可能贴近 Gemini 的工作方式。
 
 ## Goal
-在保持 AthenaQA 上层逻辑（Controller/Planner/Observer/Reflector）不变的前提下，编写一个 `QwenClient` 适配层替代 `GeminiClient`，通过 OpenAI 兼容 API（yunwu.ai 代理）使用 **qwen2.5-vl-72b-instruct** 模型进行视频理解任务。
+
+在现有 QwenClient 基础上适配 **Qwen3-Omni** 模型，通过 DashScope 官方 API 发送
+**原生视频文件**（含音频），使视频理解能力接近 Gemini 2.5 Pro。
+
+核心改动:
+1. 流式响应 (`stream=True` 强制)
+2. 视频以 `video_url` (文件路径/URL) 而非 base64 发送
+3. DashScope 端点替代 yunwu.ai 代理
+4. 音频原生保留
 
 ## 技术栈决策
-- **SDK**: `openai` Python 包（OpenAI 兼容格式）
-- **API 端点**: `https://yunwu.ai`（与 Gemini 共用的 OpenAI 兼容代理）
-- **API Key**: `QWEN_API_KEY` 来自 `api_key_config.txt`
-- **模型名**: `qwen2.5-vl-72b-instruct`
-- **视频输入策略**: 双模式（video_url 原生视频 + frame 帧提取回退）
+
+| 维度 | 决定 | 理由 |
+|------|------|------|
+| SDK | `openai` Python 包 (继续使用) | DashScope 提供 OpenAI 兼容端点 |
+| API 端点 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 阿里云官方，支持 video_url |
+| API Key | `DASHSCOPE_API_KEY`（或复用 `QWEN_API_KEY`） | 需要验证 |
+| 模型 | `qwen3-omni` / `qwen3-omni-flash` | 原生视频+音频理解 |
+| 视频输入 | `video_url` (本地 file:// 或 HTTP URL) | 原生视频，保留全部时序+音频 |
+| 流式 | `stream=True` (强制) | Qwen3-Omni API 要求 |
+| 输出模态 | `modalities=["text"]` | 只需文本，不需语音合成 |
 
 ## Current Phase
-Phase 1
+Phase 0 (待用户确认后实施)
 
 ## Phases
 
-### Phase 1: 需求分析与接口规格确认 ✅
-- [x] 完整梳理 GeminiClient 的公共 API（6 个方法 + 7 个属性）
-- [x] 确认 Controller/Planner/Observer/Reflector 对 client 的调用接口
-- [x] 确认 Qwen2.5-VL 的视频输入格式（支持 video_url + 帧提取）
-- [x] 确认 SDK 选择：OpenAI Python SDK → yunwu.ai 代理
-- [x] 确认 API 凭证：`QWEN_API_KEY` + `base_url=https://yunwu.ai`
-- [x] 记录所有发现到 findings.md
-- **Status:** complete
-
-### Phase 2: AVPConfig 扩展
-修改 `avp/config.py`（~25 行新增）：
-- [ ] 添加 `backend: str = "gemini"`（取值 `"gemini"` | `"qwen"`）
-- [ ] 添加 `qwen_api_key: str = ""`
-- [ ] 添加 `qwen_base_url: str = ""`（默认空，运行时读 env `QWEN_BASE_URL` 或 fallback 到 `GEMINI_BASE_URL`）
-- [ ] 添加 `qwen_model: str = "qwen2.5-vl-72b-instruct"`
-- [ ] 添加 `qwen_plan_model: str = ""`（可选，空则 fallback 到 `qwen_model`）
-- [ ] 添加 `qwen_video_mode: str = "video"`（取值 `"video"` | `"frames"` | `"auto"`）
-- [ ] 在 `load_config()` 中支持 env 变量 `QWEN_API_KEY`、`QWEN_BASE_URL`、`AVP_BACKEND`
-- [ ] 保持向后兼容（默认 `backend="gemini"`，所有 Gemini 行为不变）
+### Phase 0: API 连通性验证 [pending]
+**目标**: 确认 DashScope 端点、API Key、Qwen3-Omni 模型可用。
+- [ ] 0a. 检查 `api_key_config.txt` 中的 QWEN_API_KEY 是否能直连 DashScope
+- [ ] 0b. 用 curl 测试 DashScope 端点连通性
+- [ ] 0c. 用简单文本请求测试 Qwen3-Omni 模型是否可用 (stream=True)
+- [ ] 0d. 用短视频 (< 5MB) 测试 video_url 模式是否可用
+- [ ] 0e. 测试本地文件路径 `file:///path/to/video.mp4` 是否被支持
+- [ ] 0f. 如果 openai SDK + file:// 不工作，评估是否需要 `dashscope` SDK
 - **Status:** pending
 
-### Phase 3: 视频→消息转换模块
-在 `avp/video_utils.py` 新增 ~80 行：
-- [ ] `extract_frames_from_video(video_path, fps, start_sec, end_sec, max_frames, resize_short_edge) → List[base64_str]`
-  - OpenCV 按 fps/时间范围抽帧
-  - JPEG 编码 + base64 转换
-  - 短边 resize（低→480, 中→640, 高→854）
-  - 帧数钳制（max_frame_low/medium/high）
-- [ ] `encode_video_to_base64(video_path) → str`
-  - 读取整个视频文件 → base64 编码
-  - 用于 video_url 模式（`data:video/mp4;base64,...`）
-- [ ] `build_qwen_video_content(video_path, mode, fps, start, end, max_frames, resize) → List[dict]`
-  - 根据 mode="video"|"frames" 构建 OpenAI 消息内容块
-  - video 模式：`[{"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}]`
-  - frames 模式：`[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}, ...]`
-- **Status:** pending
+### Phase 1: 流式响应重构 [pending]
+**目标**: 使 `_call_text_api()` 和 `_call_video_api()` 支持 stream=True。
 
-### Phase 4: QwenClient 核心类实现
-创建 `avp/qwen_client.py`（~650 行）：
+改动文件: `avp/qwen_client.py`
 
-#### 4a. 基础结构
-- [ ] **`_OpenAICompatProxy` 内部类** — 模拟 `genai.Client` 接口:
+- [ ] 1a. 重构 `_call_text_api()`:
   ```python
-  class _OpenAICompatProxy:
-      """代理对象，使 Reflector 的 self.client.client.models.generate_content() 调用可以工作"""
-      def __init__(self, openai_client, default_model):
-          self.models = self  # self.models.generate_content() → self.generate_content()
-          self._client = openai_client
-          self._model = default_model
-      def generate_content(self, model, contents, config=None):
-          # 将 Gemini API 调用转换为 OpenAI 格式
-          messages = [{"role": "user", "content": contents}]
-          resp = self._client.chat.completions.create(model=model, messages=messages)
-          return _CompatResponse(resp.choices[0].message.content)
-  ```
-  - ⚠️ **关键**: Reflector 在 line 1983 直接调用 `self.client.client.models.generate_content()`
-
-- [ ] **`__init__()`** — 与 GeminiClient 签名兼容:
-  - 接受相同参数: model, plan_replan_model, execute_model, project, location, api_key, base_url, debug, max_frame_*, prefer_compressed, keep_temp_clips
-  - 额外参数: `qwen_video_mode="video"` (video/frames/auto)
-  - 暴露**完全相同的属性**: `prefer_compressed`, `debug`, `model`, `plan_replan_model`, `execute_model`, `keep_temp_clips`, `created_clips`, `temp_clips_dir`, `client` (= _OpenAICompatProxy)
-
-- [ ] **`initialize_client()`** — 创建 OpenAI client + _OpenAICompatProxy:
-  ```python
-  self._openai_client = openai.OpenAI(api_key=..., base_url=...)
-  self.client = _OpenAICompatProxy(self._openai_client, self.plan_replan_model)
+  # 当前 (L177-185): 非流式
+  resp = self._openai_client.chat.completions.create(model=model, messages=messages)
+  return resp.choices[0].message.content
+  
+  # 目标: 流式
+  stream = self._openai_client.chat.completions.create(
+      model=model, messages=messages, stream=True, modalities=["text"]
+  )
+  full_text = ""
+  for chunk in stream:
+      if chunk.choices and chunk.choices[0].delta.content:
+          full_text += chunk.choices[0].delta.content
+  return full_text
   ```
 
-#### 4b. plan() — 纯文本调用 → PlanSpec
-- [ ] 完全复制 GeminiClient.plan() 的逻辑结构（行 844-1003）
-- [ ] API 调用: `self._openai_client.chat.completions.create(model, messages)`
-- [ ] 响应解析: `parse_json_response()` → `validate_against_schema(PLAN_SCHEMA)`
-- [ ] Fallback: `self._get_fallback_plan(query)`
-- [ ] **关键**: 调用 `_apply_temporal_plan_guards(plan, query, video_meta, debug=self.debug)`（行 979）
-- [ ] **关键**: `store.append_role_trace("planner"|"planner_replan", round_id, prompt, response_text)`
-
-#### 4c. create_video_part() — 返回视频内容块
-- [ ] 返回 `List[dict]`（OpenAI content 块列表），而非 Gemini `Part`
-- [ ] video 模式: `[{"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}]`
-- [ ] frames 模式: `[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}, ...]`
-- [ ] FPS 钳制: 完全复制 GeminiClient 行 766-814 的逻辑
-- [ ] Duration 计算: 复制 3 策略 fallback（explicit → offsets → metadata）
-- [ ] 视频路径解析: 调用 `resolve_video_path(prefer_compressed=...)`
-
-#### 4d. infer_on_video() — 核心视频推理 → Evidence
-- [ ] **三条路径结构完全复用 GeminiClient（行 1066-1340）**:
-  - PATH A (Region + 多区域): ffmpeg 裁剪 N clips → 每 clip → create_video_part → 组合
-  - PATH B (Region + 单区域): ffmpeg 裁剪 1 clip → create_video_part
-  - PATH C (Uniform): 整视频 / ≥900s 重编码
-  - 每条路径构建完全相同的 `media_inputs` 列表（含 clip_time_base, absolute_start/end 等）
-- [ ] **消息组装**（与 Gemini 不同）:
+- [ ] 1b. 重构 `_call_video_api()`:
   ```python
-  messages = [{"role": "user", "content": [
-      *video_content_blocks,  # 来自 create_video_part()
-      {"type": "text", "text": prompt}
-  ]}]
+  # 当前 (L187-196): 非流式
+  resp = self._openai_client.chat.completions.create(model=model, messages=messages)
+  return resp.choices[0].message.content
+  
+  # 目标: 流式 + modalities
+  stream = self._openai_client.chat.completions.create(
+      model=model, messages=messages, stream=True, modalities=["text"]
+  )
+  full_text = ""
+  for chunk in stream:
+      if chunk.choices and chunk.choices[0].delta.content:
+          full_text += chunk.choices[0].delta.content
+  return full_text
   ```
-- [ ] **GenerateContentConfig 替代**: 不传 media_resolution 到 API，改为在 create_video_part 中控制帧 resize
-- [ ] **响应解析**: 完全复用 3 级 fallback（JSON → regex extraction → timestamp ±1s）
-- [ ] **关键**: 调用 `_normalize_key_evidence_to_canonical_timebase()`（行 1444）
-- [ ] **关键**: 调用 `round_intervals_full_seconds()`（行 1464）
-- [ ] **关键**: `store.append_role_trace("observer", round_id, prompt, response_text)`
-- [ ] **关键**: 构建 model_call_metadata（行 1486-1509），含 media_inputs 和 time_normalization
-- [ ] **关键**: `self.created_clips.append(clip_path)` 跟踪创建的 clip
 
-#### 4e. synthesize_final_answer() — 纯文本调用 → Dict
-- [ ] 完全复制 GeminiClient.synthesize_final_answer() 的逻辑（行 1654-1711）
-- [ ] 调用 `normalize_final_answer_output()` 归一化输出
-- [ ] **关键**: `store.append_role_trace("synthesizer", round_id, prompt, response_text)`
-
-#### 4f. 辅助方法（从 GeminiClient 复制）
-- [ ] `_get_fallback_plan()` — fallback 计划（行 1005-1013）
-- [ ] `_map_rate_to_media_res()` — spatial_token_rate → "low"|"medium"|"high"（行 836-841）
-- [ ] `_extract_timestamps()` — 正则提取时间戳
-- [ ] `_extract_confidence()` — 正则提取置信度
-- [ ] `_extract_json_field()` — 正则提取 JSON 字段
-- [ ] `_extract_key_evidence()` — 正则提取 key_evidence 列表
+- [ ] 1c. 统一错误处理: 流式调用的异常可能在迭代中抛出，需 try/except 包裹 chunk loop
+- [ ] 1d. 添加超时/重试: 流式调用可能更慢（逐 chunk），保持现有 retry 逻辑
+- [ ] 1e. 更新 `_OpenAICompatProxy.generate_content()` 同样使用流式 (Reflector 调用路径)
 - **Status:** pending
 
-### Phase 5: 工厂模式与 eval 管线集成
-- [ ] 在 `avp/qwen_client.py` 底部添加 `create_client(config) → GeminiClient|QwenClient`
-- [ ] 修改 `avp/eval_dataset.py`（~20 行）：
-  - 导入 `create_client`
-  - 根据 `cfg.backend` 调用工厂函数替代直接 `GeminiClient(...)`
-  - Qwen 路径：传入 `qwen_api_key`, `qwen_base_url`, `qwen_model`, `qwen_video_mode`
-- [ ] 修改 `avp/main.py`（~5 行）：
-  - CLI `run` 命令添加 `--backend` 选项
-  - 导入并使用 `create_client`
-- [ ] `avp/eval_parallel.py` 无需修改（子进程调度，config 透传）
-- [ ] 添加 `openai>=1.0.0` 到 `requirements.txt`
+### Phase 2: 视频输入路径重构 [pending]
+**目标**: 从 base64 data URL / frames 切换到 video_url 模式。
+
+改动文件: `avp/qwen_client.py`
+
+- [ ] 2a. 新增 `_create_video_url_part()` 方法:
+  ```python
+  def _create_video_url_part(self, video_path: str) -> List[dict]:
+      """使用 video_url 模式发送原生视频文件"""
+      # 方案 A: 直接用 file:// 路径 (需要 DashScope 支持)
+      url = f"file://{os.path.abspath(video_path)}"
+      # 方案 B: 如果 file:// 不支持，用 base64 data URL (现有逻辑)
+      return [{"type": "video_url", "video_url": {"url": url}}]
+  ```
+
+- [ ] 2b. 修改 `create_video_part()` (L246-381):
+  - 新增 `video_mode == "native"` 路径: 调用 `_create_video_url_part()`
+  - 保留 `"video"` (base64)、`"frames"` (帧提取)、`"auto"` 作为回退
+  - 默认 mode 从 `"frames"` 改为 `"native"`
+
+- [ ] 2c. 确保音频保留:
+  - 检查 `create_video_clip()` 的 `-c copy` 默认保留音频 ✅
+  - 检查 `create_reencoded_video_clip()` 的 audio_bitrate 逻辑:
+    - low: `-an` (无音频) → **改为 `-c:a aac -b:a 32k`** (保留低码率音频)
+    - medium/high: 已有 `32k`/`48k` ✅
+  - **关键改动**: 低分辨率模式不再剥离音频（Qwen3-Omni 需要音频理解）
+
+- [ ] 2d. 保留帧提取作为 fallback:
+  - 如果 video_url 失败（API 错误、文件太大），自动降级为 frames 模式
+  - 利用现有 auto 模式逻辑
+
+- **Status:** pending
+- **依赖:** Phase 0 (确认 video_url 工作方式)
+
+### Phase 3: 配置与端点更新 [pending]
+**目标**: 添加 DashScope 相关配置、更新默认值。
+
+改动文件: `avp/config.py`, `avp/config.qwen.example.json`
+
+- [ ] 3a. `avp/config.py` 新增/修改字段:
+  ```python
+  qwen_model: str = "qwen3-omni"         # 默认改为 qwen3-omni
+  qwen_base_url: str = ""                 # 默认空，运行时 fallback 到 DashScope 端点
+  qwen_video_mode: str = "native"         # 默认改为 native (原生视频)
+  ```
+
+- [ ] 3b. 环境变量优先级:
+  ```
+  DASHSCOPE_API_KEY > QWEN_API_KEY > config.qwen_api_key
+  DASHSCOPE_BASE_URL > QWEN_BASE_URL > config.qwen_base_url > "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  ```
+
+- [ ] 3c. 更新 `avp/config.qwen.example.json`:
+  ```json
+  {
+    "backend": "qwen",
+    "qwen_model": "qwen3-omni",
+    "qwen_plan_model": "qwen3-omni",
+    "qwen_video_mode": "native",
+    "qwen_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "prefer_compressed": true,
+    "max_frame_low": 512,
+    "fps": 1.0
+  }
+  ```
+
+- [ ] 3d. QwenClient.__init__() 更新默认 base_url 逻辑
 - **Status:** pending
 
-### Phase 6: 测试与验证
-- [ ] 单元验证：`extract_frames_from_video()` 帧数/时间范围/resize 正确性
-- [ ] 集成验证：`python -m avp.eval_dataset --ann avp/eval_anno/eval_lvbench.json --out avp/out/qwen_test --config avp/config.qwen.example.json --limit 1 --max-turns 1 --timeout 600`
-- [ ] 检查输出结构：`results.jsonl`, `summary.json`, `all_sample/sample_0/` 目录完整
-- [ ] 记录所有测试结果到 progress.md
+### Phase 4: 集成测试 [pending]
+**目标**: 在 basketball_q2_only.json 上测试，比较 Gemini/Qwen2.5-VL/Qwen3-Omni 效果。
+
+- [ ] 4a. 运行测试:
+  ```bash
+  source api_key_config.txt
+  python -m avp.eval_dataset \
+    --ann dataset/SportsTime/basketball_q2_only.json \
+    --out avp/out/qwen3_omni_basketball_test \
+    --config avp/config.qwen.example.json \
+    --limit 1 --max-turns 3 --timeout 1200
+  ```
+
+- [ ] 4b. 检查输出: results.jsonl, summary.json, all_sample/sample_0/
+- [ ] 4c. 分析各 agent 交互: Planner → Observer → Reflector → 最终答案
+- [ ] 4d. 写详细测试报告，与 Gemini/Qwen2.5-VL 结果对比
+
+  | 模型 | 输入方式 | 答案 | 正确 | 耗时 |
+  |------|---------|------|------|------|
+  | Qwen2.5-VL (frames) | 32 JPEGs | 3次 | ❌ | 290s |
+  | Gemini 2.5 Pro (native) | 视频+音频 | 2次 | ✅ | 164s |
+  | **Qwen3-Omni (native)** | **视频+音频** | **?** | **?** | **?** |
+
 - **Status:** pending
+- **依赖:** Phase 1, 2, 3
 
-### Phase 7: 文档与交付
-- [ ] 创建 `avp/config.qwen.example.json` 示例配置
-- [ ] 更新 README.md 添加 Qwen 后端使用说明
-- [ ] 更新 copilot_change_log.jsonl
+### Phase 5: 文档与提交 [pending]
+- [ ] 5a. 更新 README.md (移除/修改 Qwen2.5 失败提示)
+- [ ] 5b. 更新 copilot_change_log.jsonl
+- [ ] 5c. Git commit + tag `qwen3-omni`
+- [ ] 5d. Push to remote
 - **Status:** pending
+- **依赖:** Phase 4
 
-## Key Questions（已全部解决）
-| # | 问题 | 答案 |
-|---|------|------|
-| 1 | API 还是本地推理？ | **API**（通过 yunwu.ai OpenAI 兼容代理）|
-| 2 | 具体模型版本？ | **qwen2.5-vl-72b-instruct** |
-| 3 | API 端点？ | **https://yunwu.ai**（与 Gemini 共用） |
-| 4 | API Key 来源？ | **QWEN_API_KEY** from `api_key_config.txt` |
-| 5 | SDK 选择？ | **openai** Python 包 |
-| 6 | 视频怎么传？ | **双模式**：video_url（base64 整视频）优先，frames（base64 帧图片）回退 |
-| 7 | 帧提取工具？ | **OpenCV**（requirements.txt 已包含 opencv-python） |
-| 8 | WatchConfig regions？ | **ffmpeg 裁剪 clip → 再传给模型**，裁剪逻辑完全复用 |
-| 9 | 接口统一方式？ | **鸭子类型**（Controller 通过 `self.client` 调用，无需 ABC） |
+## GeminiClient vs QwenClient 对照 (指导改动方向)
 
-## Decisions Made
-| Decision | Rationale |
-|----------|-----------|
-| 仅支持 API 模式（不支持本地推理） | 用户明确选择 API，72B 模型本地推理不实际 |
-| 使用 yunwu.ai 代理 | 用户确认与 Gemini 共用 base_url |
-| openai SDK | yunwu.ai 是 OpenAI 兼容代理，openai 包最标准 |
-| 双模式视频输入 | video_url 保留 MRoPE 时序编码（最优），frames 作为通用回退 |
-| 创建独立 `avp/qwen_client.py` | 不污染 GeminiClient，单一职责 |
-| 工厂函数放在 qwen_client.py | 避免创建额外小文件，import 路径简单 |
-| 复用 ffmpeg 裁剪流程 | GeminiClient 的三条路径结构可直接移植 |
-| 保持 PromptManager 不变 | 所有 prompt 是纯文本，100% 模型无关 |
+### 视频发送方式对比
+
+| 维度 | Gemini | QwenClient (当前) | QwenClient (目标) |
+|------|--------|-------------------|-------------------|
+| 数据格式 | `Part(inlineData=Blob(data=bytes))` | base64 data URL / JPEG frames | `video_url` (file://path) |
+| 音频 | Blob 内含音频 | ❌ 帧模式丢失 | ✅ 原生视频含音频 |
+| 元数据 | `VideoMetadata(fps, startOffset, endOffset)` | 无 (帧采样时隐含) | 无 (服务端处理) |
+| 分辨率控制 | `media_resolution="MEDIA_RESOLUTION_LOW"` | resize_short_edge 控制帧大小 | 服务端自动处理 |
+| 多视频 | `contents=[prompt, Part1, Part2, ...]` | `messages[0].content=[...blocks...]` | 同上 |
+
+### API 调用方式对比
+
+| 维度 | Gemini | QwenClient (当前) | QwenClient (目标) |
+|------|--------|-------------------|-------------------|
+| 调用 | `client.models.generate_content()` | `openai.chat.completions.create()` | 同左, +stream=True |
+| 流式 | 非流式 | 非流式 | **流式** (强制) |
+| 响应 | `resp.text` | `resp.choices[0].message.content` | 累积 stream chunks |
+| 配置 | `GenerateContentConfig(media_resolution=...)` | 无 | `modalities=["text"]` |
+
+### 需要修改的代码路径
+
+| 方法 | 改动范围 | 原因 |
+|------|---------|------|
+| `_call_text_api()` (L177) | **中等** | 添加 stream=True + chunk 累积 |
+| `_call_video_api()` (L187) | **中等** | 添加 stream=True + modalities + chunk 累积 |
+| `create_video_part()` (L246) | **大** | 新增 "native" 视频路径 (video_url) |
+| `_OpenAICompatProxy.generate_content()` (L65) | **小** | 同步流式调用 |
+| `__init__()` (L97) | **小** | 默认 base_url → DashScope |
+| `initialize_client()` (L156) | **小** | 确认 base_url 默认值 |
+| `infer_on_video()` (L543) | **可能不动** | 三条路径结构不变，只是 create_video_part 输出格式变了 |
+| `plan()` (L397) | **可能不动** | 纯文本调用，但需流式 |
+| `synthesize_final_answer()` (L966) | **可能不动** | 纯文本调用，但需流式 |
+
+### 不需要修改的文件
+
+- `avp/prompt.py` — 所有 prompt 是纯文本，模型无关
+- `avp/main.py` — GeminiClient 不受影响，QwenClient 已通过工厂分离
+- `avp/eval_parallel.py` — 子进程调度，config 透传
+- `avp/video_utils.py` — clip 创建逻辑不变（可能需要微调音频保留）
+
+## Key Risks
+
+| 风险 | 影响 | 缓解 |
+|------|------|------|
+| DashScope 不接受 file:// 本地路径 | 无法用 openai SDK 直传本地文件 | 回退: 用 base64 data URL 或 dashscope SDK |
+| QWEN_API_KEY 不是 DashScope key | 无法访问 API | 需要用户提供 DashScope API key |
+| 视频太大 (>200MB) | API 拒绝 | prefer_compressed=true + 重编码逻辑已有 |
+| 流式响应格式差异 | chunk 解析失败 | openai SDK 兼容，格式标准 |
+| Qwen3-Omni 不可用 | 模型 404 | 降级到 qwen3-omni-flash |
+| 网络延迟 (DashScope 中国) | 超时 | 增加 timeout，用 stream 减少感知延迟 |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| （暂无） | — | — |
-
-## Notes
-- **视频传输大小**: base64 编码膨胀 ~33%；一个 50MB 视频 → ~67MB base64 字符串。需注意 API 请求体大小限制。
-- **MRoPE 优势**: Qwen2.5-VL 使用 MRoPE 对每帧编码绝对时间位置，即使以帧图片输入也能保持一定时序理解（优于其他 VLM）。
-- **FPS 钳制逻辑**: 从 Gemini 服务端 → Qwen 客户端；公式不变 `fps = min(fps, max_frame / duration)`。
-- **不需修改的文件**: `prompt.py`, `eval_parallel.py`, 所有数据类（WatchConfig, PlanSpec, Evidence, Blackboard, Store）。
-- 如果 video_url 模式被代理拒绝（400/413），自动降级为 frames 模式。
+| (暂无) | — | — |

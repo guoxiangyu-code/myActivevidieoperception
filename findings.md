@@ -1,4 +1,75 @@
-# Findings & Decisions: 方案B — QwenClient 适配层（API 模式）
+# Findings & Decisions: 方案A — Qwen3-Omni 迁移（DashScope 原生视频+音频）
+
+> 前一阶段: 方案B(Qwen2.5-VL frames模式) 已完成但效果不佳，tag qwen2.5 已推送。
+> 本阶段: 迁移到 Qwen3-Omni，利用 DashScope 官方 API 的原生视频+音频理解能力。
+
+---
+
+## Qwen3-Omni API 关键调研 (2026-03-29)
+
+### 1. API 端点与模型名
+
+| 模型 | model name | 特点 |
+|------|-----------|------|
+| Qwen3-Omni | `qwen3-omni` | 全模态, 30B MoE (3B激活) |
+| Qwen3-Omni-Flash | `qwen3-omni-flash` | 快速版, 65536 context |
+
+- DashScope 中国端点: `https://dashscope.aliyuncs.com/compatible-mode/v1`
+- DashScope 国际端点: `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
+
+### 2. 关键约束: stream=True 是强制的
+
+**Qwen3-Omni 仅支持流式输出**, `stream=False` 会报错。这意味着:
+- `_call_text_api()` 和 `_call_video_api()` 都必须改为流式调用
+- 需要累积 stream chunks 拼接完整响应
+
+### 3. 视频输入方式
+
+支持的 content block 格式:
+```json
+{"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
+```
+
+**关键**: DashScope 官方支持 `video_url`（yunwu.ai 代理不支持，这是之前失败的原因）
+
+视频文件传递方式:
+- **HTTP URL**: 视频必须可公开访问
+- **本地文件**: 使用 `dashscope` SDK 时，`file:///path/to/video.mp4` 会自动上传到 OSS
+- **base64 data URL**: 视频文件不推荐（体积太大）
+
+### 4. 音频支持
+
+Qwen3-Omni 原生支持视频中的音频轨道，解说音频可以帮助区分"上篮"和"三分球"。
+
+### 5. modalities 参数
+
+```python
+modalities=["text"]  # 只要文本输出，不需要语音输出
+stream=True          # 必须
+```
+
+### 6. DashScope SDK 自动文件上传
+
+`dashscope` Python SDK 传入 `file:///local/path.mp4` → 自动上传到阿里云 OSS → 替换为临时 URL。
+这解决了"本地视频如何传给云端 API"的问题。
+
+### 7. 与当前 QwenClient 的关键差异
+
+| 维度 | 当前 (Qwen2.5-VL via yunwu.ai) | 目标 (Qwen3-Omni via DashScope) |
+|------|-------------------------------|--------------------------------|
+| API 端点 | yunwu.ai (第三方代理) | DashScope (阿里云官方) |
+| 视频输入 | frames (32张JPEG image_url) | video_url (原生视频+音频) |
+| 流式 | 非流式 | 流式 (stream=True 强制) |
+| 音频 | ❌ 完全丢失 | ✅ 原生支持 |
+| 模型 | qwen2.5-vl-72b-instruct | qwen3-omni / qwen3-omni-flash |
+
+### 8. 需要验证的问题
+
+1. 用户的 QWEN_API_KEY 是否能访问 DashScope?
+2. DashScope 是否从当前服务器可达?
+3. `openai` SDK + DashScope 端点是否支持 `file://` 自动上传? (可能需要 `dashscope` SDK)
+4. 流式响应 chunk 格式与 openai SDK 兼容性?
+5. 视频大小限制 (clip 通常 10-80MB)
 
 ## Requirements
 - 保持 AthenaQA 上层逻辑（Controller/Planner/Observer/Reflector）不变

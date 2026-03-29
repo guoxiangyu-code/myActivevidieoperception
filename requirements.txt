@@ -4,6 +4,9 @@ google-genai>=0.4.0
 # OpenAI SDK (for Qwen backend via OpenAI-compatible API)
 openai>=1.0.0
 
+# DashScope SDK (for Qwen3-Omni large video upload)
+dashscope>=1.20.0
+
 # Progress bars
 tqdm>=4.66.0
 
