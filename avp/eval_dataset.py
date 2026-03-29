@@ -21,12 +21,14 @@ import re
 # Handle imports when run as script or module
 try:
     from .main import Controller, GeminiClient
+    from .qwen_client import create_client
     from .video_utils import set_metadata_source, cleanup_video_clips, ensure_temp_clips_dir
     from .config import load_config
 except ImportError:
     # Running as script, not as module
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from avp.main import Controller, GeminiClient
+    from avp.qwen_client import create_client
     from avp.video_utils import set_metadata_source, cleanup_video_clips, ensure_temp_clips_dir
     from avp.config import load_config
 
@@ -275,23 +277,11 @@ def evaluate_dataset(
                     print(f"⚠️  Warning: Could not ensure temp_clips directory: {e}")
                     # Continue anyway - create_video_clip will try to create it
                 
-                # Initialize GeminiClient (API key or Vertex AI)
-                api_key_val = (cfg.api_key or "").strip() or None
-                client = GeminiClient(
-                    model=cfg.model,  # Legacy fallback
-                    plan_replan_model=cfg.get_plan_replan_model(),
-                    execute_model=cfg.get_execute_model(),
-                    project=cfg.project,
-                    location=sample_location,
-                    api_key=api_key_val,
-                    base_url=(cfg.base_url or "").strip() or None,
-                    max_frame_low=cfg.max_frame_low,
-                    max_frame_medium=cfg.max_frame_medium,
-                    max_frame_high=cfg.max_frame_high,
-                    prefer_compressed=cfg.prefer_compressed,
-                    keep_temp_clips=cfg.keep_temp_clips,
-                    debug=cfg.debug,
-                )
+                # Initialize client (Gemini or Qwen based on config backend)
+                client = create_client(cfg)
+                # For Gemini backend, override per-sample location
+                if getattr(cfg, 'backend', 'gemini') != 'qwen' and hasattr(client, 'location'):
+                    client.location = sample_location
                 client.initialize_client()
                 
                 # Initialize Controller (save in all_sample subfolder)
