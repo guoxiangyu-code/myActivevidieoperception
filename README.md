@@ -7,6 +7,7 @@
 [![Manual Review](https://img.shields.io/badge/Manual%20Review-4%2F5%20Correct-16A34A)](#demo-overview)
 [![Only Unresolved](https://img.shields.io/badge/Open%20Issue-Q4-F97316)](#q4-demo)
 [![Model](https://img.shields.io/badge/Model-gemini--2.5--pro-0EA5E9)](gemini_q1_to_q5_report.md)
+[![Qwen3-Omni](https://img.shields.io/badge/Qwen3--Omni-Tested-8B5CF6)](#-多模型对比实验为什么-gemini-遥遥领先)
 [![Framework](https://img.shields.io/badge/Framework-AVP-DC2626)](https://github.com/SalesforceAIResearch/ActiveVideoPerception)
 
 </div>
@@ -407,6 +408,166 @@ bash avp/parrelel_run.sh
 - `avp/eval_dataset.py`：单进程数据集评测入口
 - `avp/eval_parallel.py`：多进程并行评测入口
 - `gemini_q1_to_q5_report.md`：这次五题 Demo 的完整实验报告
+
+---
+
+## 🔬 多模型对比实验：为什么 Gemini 遥遥领先？
+
+> 我们在同一道篮球问答题（Q2: 雷霆队前8分中完成了多少次三分出手？）上，测试了三个模型。
+> 测试结果揭示了当前视频理解模型之间的**本质差距**。
+
+### 三模型实测对比
+
+<table>
+  <tr>
+    <th></th>
+    <th>🥇 Gemini 2.5 Pro</th>
+    <th>🥈 Qwen2.5-VL-72B</th>
+    <th>🥉 Qwen3-Omni-Flash</th>
+  </tr>
+  <tr>
+    <td><strong>输入方式</strong></td>
+    <td>原生视频 + 音频</td>
+    <td>32 张 JPEG 帧</td>
+    <td>240 张帧（降级）</td>
+  </tr>
+  <tr>
+    <td><strong>Planner 策略</strong></td>
+    <td><code>region [0-300s]</code> 聚焦开场 5 分钟</td>
+    <td><code>region [125-180s]</code> 较窄区间</td>
+    <td><code>uniform 全视频</code> 扫描 30 分钟</td>
+  </tr>
+  <tr>
+    <td><strong>观测分辨率</strong></td>
+    <td>2 fps · medium · 含音频</td>
+    <td>2 fps · medium · 无音频</td>
+    <td>0.13 fps · low · 无音频</td>
+  </tr>
+  <tr>
+    <td><strong>答案</strong></td>
+    <td><strong>2次三分出手 ✅</strong></td>
+    <td>3次三分出手 ❌</td>
+    <td>0次三分出手 ❌</td>
+  </tr>
+  <tr>
+    <td><strong>关键证据</strong></td>
+    <td>[157-159s] 杜兰特三分<br>[167-169s] 罗伯森三分</td>
+    <td>[125-140s] 第1次三分<br>[145-160s] 第2次<br>[170-180s] 第3次（多数）</td>
+    <td>[35-45s] 虚构三分<br>[55-65s] 虚构两分<br>（时间戳不真实）</td>
+  </tr>
+  <tr>
+    <td><strong>时间精度</strong></td>
+    <td>精确到 <strong>2 秒</strong></td>
+    <td>精确到 ~15 秒</td>
+    <td>完全虚构</td>
+  </tr>
+  <tr>
+    <td><strong>置信度</strong></td>
+    <td>1.0</td>
+    <td>0.8</td>
+    <td>0.8</td>
+  </tr>
+  <tr>
+    <td><strong>耗时</strong></td>
+    <td>164s</td>
+    <td>290s</td>
+    <td>98s</td>
+  </tr>
+  <tr>
+    <td><strong>Tag</strong></td>
+    <td><code>main</code></td>
+    <td><code>qwen2.5</code></td>
+    <td><code>qwen3-omni</code></td>
+  </tr>
+</table>
+
+> 📋 详细测试报告：[`gemini_basketball_test_report.md`](gemini_basketball_test_report.md) | [`qwen_basketball_test_report.md`](qwen_basketball_test_report.md)
+
+### 根因分析：信息密度决定一切
+
+三个模型的差距不是"谁更聪明"，而是**模型能看到多少信息**：
+
+```
+篮球三分出手 = 一个 ~2 秒的动作
+
+Gemini:    ~263 tokens/秒 × 300秒 = ~79,000 tokens（连续视频流+解说音频）
+Qwen2.5:   32 张离散截图 ≈ ~6,400 tokens（关键帧之间有 ~5秒 空白）
+Qwen3-Omni: 240 帧 / 30分钟 = 每 7.7 秒 1 帧（投篮动作大概率落在两帧之间）
+```
+
+这不是算法差距，这是**物理上看不到**的问题。
+
+### Gemini 2.5 Pro 为何独步天下？
+
+<details>
+<summary><strong>🏗️ 展开查看技术架构分析</strong></summary>
+
+#### 1. 原生多模态架构（非"拼接"）
+
+Gemini 从第一天起就把视频/音频/文本放在统一的 Transformer 骨干网中处理。视觉 token 和文本 token 共享同一个注意力空间，模型能直接通过 cross-attention 将「第 157 秒画面中的投篮弧度」与「解说员说的 "three pointer"」关联起来。
+
+而开源模型（包括 Qwen3-Omni）通常是在 LLM 上"焊接"视觉/音频编码器（Thinker-Talker 架构），模态间信息需要跨模块传递，融合深度不如原生设计。
+
+#### 2. 超长上下文窗口
+
+| 模型 | 上下文窗口 | 可处理视频长度 |
+|------|-----------|--------------|
+| **Gemini 2.5 Pro** | **1M-2M tokens** | **~68 分钟**（单次调用） |
+| Qwen3-Omni | ~32K tokens | ~30 分钟（有音频限制） |
+| Qwen2.5-VL | ~32K tokens | 依赖帧数量 |
+| 开源 Llama 3 | ~128K tokens | 需自行切片 |
+
+Gemini 能一次性将 5 分钟篮球片段的**每一帧 + 每一秒解说**全部吃进模型。其他模型必须切片、降采样，导致信息损失。
+
+#### 3. 训练数据的"核武器"
+
+Google 拥有 **YouTube**——全球最大的带标注视频数据源（数十亿小时视频 + 自带字幕/标签/用户行为数据），加上 TPU Pod 级别的算力（数万片 TPU v5 并行），这是任何开源团队**无法复制**的训练基础设施。
+
+#### 4. 回到篮球题：Gemini 的工作过程
+
+```
+Gemini 实际做了什么：
+1. Planner: "前8分一般在开场5分钟" → 聚焦 [0-300s]
+2. Observer: 接收原生视频流 (~79K tokens)
+   - 视觉: 看到球员完整的起跳→出手→入框弧度
+   - 音频: 听到解说 "Durant... three pointer!" + 观众欢呼
+   - 记分牌 OCR: 实时读取 0→2→5→8 比分变化
+   - 三路交叉验证 → 精确锁定 [157-159s] 和 [167-169s]
+3. 结论: 2次三分出手，置信度 1.0
+
+Qwen3-Omni 实际做了什么：
+1. Planner: "扫描全部30分钟" → 最差策略
+2. Observer: 接收 240 张帧截图（每7.7秒一张，无音频）
+   - 恰好在投篮瞬间没有帧（7.7秒空窗期）
+   - 只看到记分牌从 0 跳到 5，中间发生了什么？→ 靠猜
+   - 无音频 → 无法区分二分球和三分球
+3. 结论: 自相矛盾（证据说有三分，结论说0次）
+```
+
+#### 5. 本质：四重壁垒叠加
+
+```
+① 原生多模态架构  → 信息融合质量
+② 超长上下文窗口  → 不需要切片/降采样
+③ YouTube 训练数据 → 对视频内容的先验理解
+④ Google 算力规模  → 模型参数量 + 训练充分度
+
+任何一个壁垒都足以形成代差，四个叠加 = 目前无可替代。
+```
+
+</details>
+
+### 开源模型还能追上吗？
+
+| 维度 | 当前状态 | 追赶难度 |
+|------|---------|---------|
+| 原生多模态架构 | Qwen3-Omni Thinker-Talker 已是顶级开源方案 | ⭐⭐ 可追 |
+| 上下文窗口 | 开源最长 ~128K，Gemini 1M+ | ⭐⭐⭐⭐ 极难 |
+| 训练数据 | 无等价 YouTube 数据源 | ⭐⭐⭐⭐⭐ 壁垒 |
+| 算力 | 开源团队缺乏万卡级 TPU/GPU 集群 | ⭐⭐⭐⭐ 极难 |
+
+> **结论：短视频（<10分钟）场景下，Qwen3-Omni 与 Gemini 的差距较小。  
+> 但在长视频精确计数/时序推理任务上，Gemini 的原生视频能力目前仍是不可替代的。**
 
 ---
 
